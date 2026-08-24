@@ -119,6 +119,12 @@ export function SettingsForm() {
           min={0}
         />
         <NumberField
+          label="Max 9:16 renders per run"
+          value={settings.maxRendersPerRun}
+          onChange={(v) => save({ ...settings, maxRendersPerRun: v })}
+          min={0}
+        />
+        <NumberField
           label="Daily AI budget (USD, 0 = no cap)"
           value={settings.dailyAiBudgetUsd}
           onChange={(v) => save({ ...settings, dailyAiBudgetUsd: v })}

@@ -9,26 +9,23 @@ export interface DiscoverySettings {
   candidatesPerRun: number;
   maxQuickScansPerRun: number;
   maxDetailedAnalysesPerRun: number;
+  maxRendersPerRun: number;
   dailyAiBudgetUsd: number;
 }
 
+// Deliberately conservative for the first live run against real
+// YouTube/Anthropic/ffmpeg infrastructure — one category, small caps at every
+// stage. Raise these from the Settings page once a full run has been
+// verified end to end.
 export const DEFAULT_SETTINGS: DiscoverySettings = {
   automaticDiscoveryEnabled: true,
   discoveryFrequencyHours: 4,
-  enabledCategories: [
-    "road_rage",
-    "dashcam",
-    "instant_karma",
-    "crazy_driving",
-    "near_misses",
-    "crashes",
-    "confrontations",
-    "fails",
-  ],
+  enabledCategories: ["road_rage"],
   minViralScore: 70,
-  candidatesPerRun: 500,
-  maxQuickScansPerRun: 100,
-  maxDetailedAnalysesPerRun: 25,
+  candidatesPerRun: 20,
+  maxQuickScansPerRun: 5,
+  maxDetailedAnalysesPerRun: 2,
+  maxRendersPerRun: 2,
   dailyAiBudgetUsd: 5,
 };
 
