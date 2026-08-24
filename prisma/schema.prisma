@@ -1,0 +1,367 @@
+// Viral Clip Finder — database schema
+// See CLAUDE.md for architecture notes.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SourceName {
+  youtube
+  reddit
+}
+
+enum Category {
+  road_rage
+  dashcam
+  instant_karma
+  crazy_driving
+  near_misses
+  crashes
+  confrontations
+  arguments
+  fails
+  funny_moments
+  unexpected_moments
+  satisfying_moments
+  shocking_moments
+  weird_moments
+  general_viral
+}
+
+// Lifecycle of a discovered source video moving through the pipeline.
+enum VideoProcessingStatus {
+  discovered
+  filtered_out
+  queued_for_scan
+  scanning
+  scanned
+  no_candidates
+  error
+}
+
+enum DiscoveryRunStatus {
+  running
+  completed
+  failed
+}
+
+enum AnalysisJobType {
+  quick_scan
+  detailed_analysis
+}
+
+enum AnalysisJobStatus {
+  pending
+  running
+  succeeded
+  failed
+}
+
+// Lifecycle of one detected viral moment, driven by the user from the dashboard.
+enum ClipStatus {
+  moment_found
+  tiktok_processing
+  ready
+  saved
+  editing
+  used
+  rejected
+  no_good_moment
+  error
+}
+
+enum TikTokVersionStatus {
+  queued
+  processing
+  ready
+  failed
+  unavailable // source does not permit / support downloading+re-encoding
+}
+
+// ---------------------------------------------------------------------------
+// Source configuration
+// ---------------------------------------------------------------------------
+
+model Source {
+  id        String   @id @default(cuid())
+  name      SourceName @unique
+  enabled   Boolean  @default(true)
+  // Free-form per-source config (rate limits, search defaults, etc.)
+  config    Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accounts       SourceAccount[]
+  searchQueries  SearchQuery[]
+  sourceVideos   SourceVideo[]
+
+  @@map("sources")
+}
+
+// Credentials / accounts used to query a source (mostly for future
+// multi-account or OAuth-based connectors). Never store raw secrets here in
+// plaintext beyond what the source itself requires — this is a private
+// single-user tool, but keep the shape ready for real secret storage.
+model SourceAccount {
+  id        String   @id @default(cuid())
+  sourceId  String
+  source    Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  label     String
+  active    Boolean  @default(true)
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@map("source_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Discovery
+// ---------------------------------------------------------------------------
+
+model SearchQuery {
+  id           String    @id @default(cuid())
+  sourceId     String
+  source       Source    @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  category     Category
+  text         String
+  active       Boolean   @default(true)
+  timesUsed    Int       @default(0)
+  lastUsedAt   DateTime?
+  generatedBy  String    @default("seed") // "seed" | "rotation" | "long_tail"
+  createdAt    DateTime  @default(now())
+
+  sourceVideos SourceVideo[]
+
+  @@unique([sourceId, category, text])
+  @@index([category, active])
+  @@map("search_queries")
+}
+
+model DiscoveryRun {
+  id                String              @id @default(cuid())
+  status            DiscoveryRunStatus  @default(running)
+  startedAt         DateTime            @default(now())
+  finishedAt        DateTime?
+  queriesUsed       Int                 @default(0)
+  candidatesFound   Int                 @default(0)
+  uniqueCandidates  Int                 @default(0)
+  duplicatesSkipped Int                 @default(0)
+  errorMessage      String?
+  stats             Json                @default("{}")
+
+  sourceVideos SourceVideo[]
+
+  @@map("discovery_runs")
+}
+
+// One row per (source, source video id) ever discovered — never re-inserted.
+model SourceVideo {
+  id                String                 @id @default(cuid())
+  sourceId          String
+  source            Source                 @relation(fields: [sourceId], references: [id])
+  sourceVideoId     String
+  url               String
+  title             String
+  description       String                 @default("")
+  thumbnailUrl      String?
+  channelName       String?
+  channelId         String?
+  durationSeconds   Float?
+  uploadDate        DateTime?
+  viewCount         Int?
+  likeCount         Int?
+  commentCount      Int?
+  category          Category
+  discoveryQueryId  String?
+  discoveryQuery    SearchQuery?           @relation(fields: [discoveryQueryId], references: [id])
+  discoveryRunId    String?
+  discoveryRun      DiscoveryRun?          @relation(fields: [discoveryRunId], references: [id])
+  discoveredAt      DateTime               @default(now())
+
+  preliminaryScore  Float                  @default(0)
+  viewVelocity      Float?                 // views per hour since upload, when computable
+
+  status            VideoProcessingStatus  @default(discovered)
+  errorMessage      String?
+
+  titleFingerprint  String?                // normalized-title hash, for cheap dedup
+
+  analysisJobs      AnalysisJob[]
+  candidateWindows  CandidateWindow[]
+  detectedMoments   DetectedMoment[]
+  duplicateFingerprints DuplicateFingerprint[]
+
+  @@unique([sourceId, sourceVideoId])
+  @@index([status])
+  @@index([category])
+  @@index([titleFingerprint])
+  @@map("source_videos")
+}
+
+model DuplicateFingerprint {
+  id            String       @id @default(cuid())
+  sourceVideoId String
+  sourceVideo   SourceVideo  @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  kind          String       // "title_hash" | "url" | "perceptual_hash" | "audio_hash"
+  value         String
+  createdAt     DateTime     @default(now())
+
+  @@index([kind, value])
+  @@map("duplicate_fingerprints")
+}
+
+// A quick-scan or detailed-analysis job run against one source video.
+model AnalysisJob {
+  id             String            @id @default(cuid())
+  sourceVideoId  String
+  sourceVideo    SourceVideo       @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  type           AnalysisJobType
+  status         AnalysisJobStatus @default(pending)
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  errorMessage   String?
+  costUsd        Float             @default(0)
+  createdAt      DateTime          @default(now())
+
+  @@index([sourceVideoId, type])
+  @@map("analysis_jobs")
+}
+
+// Broad-scan (pass 1) candidate window on a source video, generously padded.
+model CandidateWindow {
+  id             String       @id @default(cuid())
+  sourceVideoId  String
+  sourceVideo    SourceVideo  @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  startSeconds   Float
+  endSeconds     Float
+  reason         String       @default("")
+  analyzed       Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  detectedMoments DetectedMoment[]
+
+  @@map("candidate_windows")
+}
+
+// A specific viral moment found inside a candidate window (pass 2 output).
+model DetectedMoment {
+  id                 String            @id @default(cuid())
+  sourceVideoId      String
+  sourceVideo        SourceVideo       @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  candidateWindowId  String?
+  candidateWindow    CandidateWindow?  @relation(fields: [candidateWindowId], references: [id])
+
+  category           Category
+  title              String
+  description        String            // observable-only explanation
+  reason             String            // why this scored the way it did
+
+  startSeconds       Float
+  peakSeconds         Float
+  endSeconds         Float
+
+  scores             Json              // { hook, visual_action, conflict, escalation, surprise, emotion, payoff, understandability, retention, rewatch, tiktok_suitability }
+  viralScore         Int
+  confidence         Float
+
+  // Subject bounding boxes at a handful of instants across the moment, as
+  // returned by pass-2 analysis — TrackedKeyframe[] (see src/video/types.ts).
+  // Persisted so a render retry never needs another AI call to re-derive
+  // the smart-crop pan path.
+  trackedKeyframes   Json              @default("[]")
+
+  status             ClipStatus        @default(moment_found)
+  userNote           String?
+  savedAt            DateTime?
+  usedAt             DateTime?
+  rejectedAt         DateTime?
+
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  tikTokVersion      TikTokVersion?
+
+  @@index([status, viralScore])
+  @@index([category, viralScore])
+  @@index([createdAt])
+  @@map("detected_moments")
+}
+
+// The rendered clean 9:16 vertical export of a detected moment.
+model TikTokVersion {
+  id               String               @id @default(cuid())
+  momentId         String               @unique
+  moment           DetectedMoment       @relation(fields: [momentId], references: [id], onDelete: Cascade)
+  status           TikTokVersionStatus  @default(queued)
+  storageKey       String?              // path/key in local or object storage
+  width            Int                  @default(1080)
+  height           Int                  @default(1920)
+  durationSeconds  Float?
+  fps              Float?
+  fileSizeBytes    Int?
+  cropKeyframes    Json                 @default("[]") // [{ timeSeconds, x, y, w, h }]
+  errorMessage     String?
+  renderedAt       DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  @@map("tiktok_versions")
+}
+
+// ---------------------------------------------------------------------------
+// Cost tracking
+// ---------------------------------------------------------------------------
+
+model ApiUsage {
+  id              String   @id @default(cuid())
+  provider        String   // "anthropic" | "youtube" | "reddit"
+  operation       String   // "quick_scan" | "detailed_analysis" | "search" | ...
+  tokensIn        Int      @default(0)
+  tokensOut       Int      @default(0)
+  costUsd         Float    @default(0)
+  sourceVideoId   String?
+  momentId        String?
+  discoveryRunId  String?
+  createdAt       DateTime @default(now())
+
+  @@index([provider, createdAt])
+  @@map("api_usage")
+}
+
+// ---------------------------------------------------------------------------
+// Settings (single-row-per-key store, edited from the Settings page)
+// ---------------------------------------------------------------------------
+
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+model ErrorLog {
+  id        String   @id @default(cuid())
+  scope     String   // "discovery" | "quick_scan" | "detailed_analysis" | "render" | ...
+  message   String
+  stack     String?
+  context   Json      @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([scope, createdAt])
+  @@map("error_logs")
+}
