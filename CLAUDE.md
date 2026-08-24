@@ -1,0 +1,96 @@
+@AGENTS.md
+
+# CLAUDE.md
+
+Guidance for a future Claude Code session working in this repository. Read `README.md` first for
+the product/architecture overview — this file is conventions and gotchas that aren't obvious from
+the code.
+
+## What this is
+
+An automatic viral-clip discovery tool (see README.md for the full pipeline). It is NOT an
+upload-first video editor — the default experience is an already-populated dashboard, driven by a
+background `worker` process. Do not add an "upload video" flow as the primary entry point; manual
+URL import, if ever added, is explicitly a secondary tool per the product brief.
+
+## Conventions
+
+- **Every AI vision call goes through `src/ai/providers/claude.ts::analyzeFrames`.** It forces
+  structured output via `output_config.format` + a Zod schema (not tool-use forcing, not prose
+  parsing) and records cost to `ApiUsage` on every call. Never call the Anthropic SDK directly
+  from `analysis/`.
+- **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
+  never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
+  `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.
+- **`OBSERVABLE_ONLY_RULE` in `src/analysis/schemas.ts`** must stay baked into both quick-scan and
+  detailed-analysis system prompts if you touch them — moment descriptions must describe only
+  what's visible, never assert intent/motive.
+- **No creative editing in the render path, ever.** `video/renderVertical.ts` does crop+scale+trim
+  and nothing else. If a future request asks for captions/music/voice-over/overlays, that is a
+  deliberate scope change from the product brief — confirm with the user before adding it, don't
+  just bolt it onto this renderer.
+- **`src/sources/registry.ts` is the only place discovery/analysis code should look up a source.**
+  Never import `youtube/index.ts` or `reddit/index.ts` directly outside of `src/sources/`.
+- **Resumability:** `SourceVideo.status` and `DetectedMoment.status`/`TikTokVersion.status` are
+  the checkpoints. `jobs/analysis.ts` and `jobs/processing.ts` only pick up videos/moments in the
+  right status, so a worker restart mid-run doesn't redo already-finished (paid) AI work — keep
+  that property if you touch those job files. `DetectedMoment.trackedKeyframes` is persisted
+  specifically so a render retry never needs another Claude call to re-derive the crop path.
+- **Every job/render step wraps its own try/catch and writes to `ErrorLog`/`*.errorMessage`**
+  (`src/lib/errorLog.ts`) rather than throwing out of the pipeline — one bad video must never stop
+  the rest of a discovery/analysis run. Preserve that per-item isolation if you restructure
+  `jobs/analysis.ts` or `jobs/processing.ts`.
+
+## Stack-specific gotchas
+
+- **Prisma is deliberately pinned to v6** (`prisma-client-js` generator), not v7. Prisma 7 removed
+  inline `datasource.url` and requires a driver-adapter passed to the `PrismaClient` constructor —
+  more moving parts than this project needs. Don't "upgrade" to v7 without a real reason; if you
+  do, you'll need to rewrite `src/database/client.ts` around an adapter.
+- **Next.js 16 renamed `middleware.ts` → `src/proxy.ts`** (function name `proxy`, not
+  `middleware`). This project's auth gate lives there. The bundled per-version docs at
+  `node_modules/next/dist/docs/` are authoritative over training-data assumptions about Next.js —
+  re-read the relevant guide there before making App Router changes; conventions (async
+  `params`/`searchParams`, route handler signatures, etc.) have moved around across versions.
+- **The login page (`src/app/login/`) is deliberately outside the `(dashboard)` route group** so
+  it doesn't get the nav sidebar. Any new top-level page that should show the sidebar goes inside
+  `src/app/(dashboard)/`.
+- **List pages (`MomentFeed.tsx`) fetch client-side**, not via server-component data fetching —
+  this keeps filter/sort state in the URL via `useSearchParams`/`router.replace` without a full
+  page reload, and keeps action buttons (save/reject/etc.) optimistic (remove-from-list on
+  success) without juggling server-action revalidation. Follow that pattern for new list views
+  rather than mixing in server-fetched data for the same list.
+- **`eslint-plugin-react-hooks`'s newer rules (`set-state-in-effect`, `purity`) are strict** about
+  fetch-on-mount patterns and calling `Date.now()`/similar in non-obviously-event-handler
+  functions. The existing suppressions in `MomentFeed.tsx`/`SourcesPanel.tsx` are deliberate, not
+  oversights — prefer restructuring to avoid the impure call (see `SettingsForm.tsx`'s `saved`
+  boolean instead of a `Date.now()` timestamp) over blanket-disabling the rule.
+
+## Local development
+
+```bash
+npm install
+cp .env.example .env   # at minimum DATABASE_URL; see README.md for the rest
+npm run db:migrate     # or `npx prisma migrate deploy` against an existing database
+npm run db:seed
+npm run dev             # dashboard
+npm run worker           # background pipeline — run alongside dev in a second terminal
+```
+
+`ffmpeg`/`ffprobe`/`yt-dlp` must be on `PATH` for the video pipeline to do anything real — without
+them, discovery/dedup/scoring/the dashboard all still work, but analysis jobs will fail once they
+reach frame extraction. That's expected in an environment without those binaries (this project was
+built in one) — verify the video pipeline for real before relying on it.
+
+## Testing
+
+```bash
+npm run typecheck
+npx eslint .
+npm run build
+```
+
+No test suite is checked in yet. If you add one, follow the existing project's lead
+(`road-rage-clipper`, a sibling project) of mocking external APIs (Anthropic/YouTube/Reddit) in
+HTTP-layer tests and only running real ffmpeg for filter-graph-correctness tests — never call
+paid APIs from tests.
