@@ -1,5 +1,4 @@
 import path from "node:path";
-import { copyFile } from "node:fs/promises";
 import { prisma } from "@/database/client";
 import { getSettings } from "@/database/settings";
 import { getSource } from "@/sources/registry";
@@ -9,7 +8,7 @@ import { computeSmartCropKeyframes } from "@/video/smartCrop";
 import { claudeVisionTracker } from "@/video/objectTracking";
 import { renderVerticalClip } from "@/video/renderVertical";
 import { scratchDirForRender, cleanupScratchDir } from "@/lib/scratch";
-import { absolutePathFor, ensureStorageDirFor, fileSizeBytes, storageKeyFor } from "@/storage";
+import { storage, storageKeyFor } from "@/storage";
 import { logError } from "@/lib/errorLog";
 import type { Prisma } from "@/generated/prisma";
 
@@ -89,9 +88,7 @@ async function renderOneMoment(moment: MomentWithVideo): Promise<boolean> {
     });
 
     const storageKey = storageKeyFor(moment.id);
-    await ensureStorageDirFor(storageKey);
-    await copyFile(renderedPath, absolutePathFor(storageKey));
-    const sizeBytes = await fileSizeBytes(storageKey);
+    const { sizeBytes } = await storage.upload(storageKey, renderedPath);
 
     await prisma.tikTokVersion.update({
       where: { id: tikTokVersion.id },

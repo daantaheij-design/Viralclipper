@@ -110,7 +110,18 @@ paid APIs from tests.
 
 `Dockerfile` + `railway.json` (web) + `railway.worker.json` (worker) are Railway-specific but
 generic enough to adapt to any container platform — see README.md's "Deploying to Railway"
-section for the full walkthrough, including why the web and worker services need a **shared**
-storage volume (the worker renders files the web service's `/api/media/` route serves, but they're
-separate containers) and why both services' start commands run `prisma migrate deploy` before
-their actual process.
+section for the full walkthrough, including why rendered clips go through a **Storage Bucket**
+(`src/storage/s3.ts`) rather than local disk once web and worker are separate containers (Railway
+Volumes can't be attached to more than one service), and why both services' start commands run
+`prisma migrate deploy` before their actual process.
+
+## Storage backends
+
+`src/storage/index.ts` picks between `local.ts` (default) and `s3.ts` (whenever `S3_BUCKET` is
+set) — that's the only place the choice is made; nothing else in the app should import
+`local.ts`/`s3.ts` directly, or check `env.s3Bucket` itself. Both implement the same
+`StorageBackend` interface (`src/storage/types.ts`): `upload`, `exists`, and `resolve` (which
+returns either `{ type: "stream", path }` for the media route to stream itself, or
+`{ type: "redirect", url }` — a presigned URL — for the route to 302 to). If you add a third
+backend, it only needs to implement that interface; the render job (`jobs/processing.ts`) and the
+media route (`app/api/media/[momentId]/route.ts`) don't change.
