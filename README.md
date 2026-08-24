@@ -135,21 +135,37 @@ video download/analysis/rendering are minutes-long, stateful, disk-using operati
 
 ## Deploying to Railway
 
-The repo ships a `Dockerfile` (Node 22 + ffmpeg + yt-dlp) and two Railway config-as-code files —
-`railway.json` (web service, the default Railway picks up) and `railway.worker.json` (worker
-service, point a second service at this file explicitly). Both services build from the same
-Dockerfile/image; only the start command differs.
+The repo ships one `Dockerfile` (Node 22 + ffmpeg + yt-dlp) shared by both services, and a root
+`railway.json` that only declares the **build** (`builder: DOCKERFILE`) — deliberately nothing
+about start commands or health checks. Railway applies `railway.json` as a default to every
+service deployed from this repo, and per-service fields committed there (like `deploy.*`) end up
+applying to *all* of them, including a worker with no HTTP server to health-check. Per-service
+**Start Command** and **Healthcheck Path**, set directly in each service's Settings in the Railway
+dashboard, always take priority over `railway.json` — that's the reliable way to make one service
+a web server and another a worker from the same repo, rather than committing a second
+"config-as-code" file and pointing a service at it by path (that per-service file-path override
+does not reliably isolate every field, which is exactly the healthcheck bleed-through this section
+fixes — don't reintroduce it).
 
 ### 1. Create the project
 
 1. New Railway project → **Deploy from GitHub repo** → this repo. This becomes your **web**
-   service; Railway auto-detects `railway.json` (Dockerfile build, `npm run start`, health check
-   at `/api/health`).
+   service.
 2. **+ New → Database → PostgreSQL.** Railway provisions it and exposes a `DATABASE_URL`
    reference variable other services in the project can consume.
-3. **+ New → GitHub repo** again, same repo, to create the **worker** service. In its
-   Settings → **Config-as-code**, set the file path to `railway.worker.json` so it runs
-   `npm run start:worker` instead of the web server.
+3. **+ New → GitHub repo** again, same repo, to create the **worker** service.
+4. Configure each service's Settings → **Deploy** tab directly (see the table below) — do **not**
+   rely on `railway.json` for anything past the Dockerfile build.
+
+| Service | Start Command | Healthcheck Path |
+| --- | --- | --- |
+| **web** | `npx prisma migrate deploy && npm run start` | `/api/health` |
+| **worker** | `npx prisma migrate deploy && npm run start:worker` | *(leave empty — no HTTP server to check)* |
+
+If the worker service shows a Healthcheck Path left over from before (e.g. `/api/health` inherited
+from `railway.json`), clear it explicitly in its Settings — an empty Healthcheck Path means
+Railway just tracks whether the process is running, which is the correct behavior for a background
+worker.
 
 ### 2. Storage bucket (S3-compatible)
 
@@ -197,10 +213,10 @@ services via a shared variable group, or just paste the same values twice):
 
 ### 4. Migrations
 
-Both `railway.json` and `railway.worker.json` start commands run `npx prisma migrate deploy`
-before starting their actual process. This is safe to run from both services on every deploy —
-Prisma's migration runner takes a database-level lock, so if both containers start at once, one
-just waits its turn instead of racing.
+Both services' Start Commands (set in step 1) run `npx prisma migrate deploy` before starting
+their actual process. This is safe to run from both services on every deploy — Prisma's migration
+runner takes a database-level lock, so if both containers start at once, one just waits its turn
+instead of racing.
 
 ### 5. First live test — production-safe by default
 

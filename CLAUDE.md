@@ -108,12 +108,21 @@ paid APIs from tests.
 
 ## Deployment
 
-`Dockerfile` + `railway.json` (web) + `railway.worker.json` (worker) are Railway-specific but
-generic enough to adapt to any container platform — see README.md's "Deploying to Railway"
-section for the full walkthrough, including why rendered clips go through a **Storage Bucket**
-(`src/storage/s3.ts`) rather than local disk once web and worker are separate containers (Railway
-Volumes can't be attached to more than one service), and why both services' start commands run
-`prisma migrate deploy` before their actual process.
+`Dockerfile` + `railway.json` are Railway-specific but generic enough to adapt to any container
+platform — see README.md's "Deploying to Railway" section for the full walkthrough. Two things
+worth knowing before touching either file:
+
+- **`railway.json` intentionally has no `deploy` section.** It used to (start command, health
+  check path), but Railway applies the root `railway.json` as a default to every service deployed
+  from this repo — so a `deploy.healthcheckPath` there was reaching the worker service too, which
+  has no HTTP server and would fail that check. Start Command and Healthcheck Path now live in
+  each Railway service's own dashboard Settings (which always override `railway.json`), not in a
+  committed file. Do not put `deploy.*` back in `railway.json`, and do not resurrect a second
+  `railway.<service>.json` file pointed at via a per-service "config file path" — that per-service
+  override does not reliably isolate every field either, which is exactly what caused this.
+- Rendered clips go through a **Storage Bucket** (`src/storage/s3.ts`) rather than local disk once
+  web and worker are separate containers, since Railway Volumes can't be attached to more than one
+  service; both services' Start Commands run `prisma migrate deploy` before their actual process.
 
 ## Storage backends
 
