@@ -4,7 +4,7 @@ import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { prisma } from "@/database/client";
-import { absolutePathFor } from "@/storage";
+import { storage } from "@/storage";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +16,18 @@ export async function GET(request: NextRequest, context: { params: Promise<{ mom
     return NextResponse.json({ error: "Not ready" }, { status: 404 });
   }
 
-  const filePath = absolutePathFor(tikTokVersion.storageKey);
+  const resolved = await storage.resolve(tikTokVersion.storageKey);
+  if (!resolved) return NextResponse.json({ error: "File missing" }, { status: 404 });
+
+  // Object storage (S3-compatible): hand the browser a presigned URL
+  // directly — it supports Range requests (video seeking) on its own, so
+  // there's no reason to proxy the bytes through this server.
+  if (resolved.type === "redirect") {
+    return NextResponse.redirect(resolved.url, { status: 302 });
+  }
+
+  // Local disk: stream it ourselves, with Range support for seeking.
+  const filePath = resolved.path;
   const stats = await stat(filePath).catch(() => null);
   if (!stats) return NextResponse.json({ error: "File missing" }, { status: 404 });
 

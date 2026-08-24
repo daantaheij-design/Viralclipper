@@ -39,6 +39,8 @@ src/
     index.ts                 Long-running scheduler (node-cron) — the primary driver
     runOnce.ts                 One-shot pipeline run (`npm run worker:once`)
   database/               Prisma client, typed settings store, moment queries
+  storage/                Where rendered clips live — local disk or S3-compatible object
+                           storage (index.ts picks the backend; see "Deploying to Railway")
   app/                    Next.js dashboard (App Router) + JSON API routes
 ```
 
@@ -149,19 +151,29 @@ Dockerfile/image; only the start command differs.
    Settings → **Config-as-code**, set the file path to `railway.worker.json` so it runs
    `npm run start:worker` instead of the web server.
 
-### 2. Shared storage volume
+### 2. Storage bucket (S3-compatible)
 
-The worker renders 9:16 clips to local disk; the web service's `/api/media/[momentId]` route (the
-preview player and "Download 9:16" button) reads them back — but web and worker are **separate
-containers**, so local disk isn't shared between them unless you attach a volume to both:
+The worker renders 9:16 clips; the web service's `/api/media/[momentId]` route (the preview
+player and "Download 9:16" button) reads them back — but web and worker are **separate
+containers** on Railway, and Railway Volumes cannot be attached to more than one service. Use a
+Railway **Storage Bucket** (S3-compatible object storage) instead, which both services reach over
+the network rather than a shared disk:
 
-1. On the **worker** service: Settings → **Volumes** → create a volume, mount path `/data/storage`.
-2. Attach that **same volume** to the **web** service too, same mount path `/data/storage`.
-3. Set `STORAGE_DIR=/data/storage` as a variable on **both** services.
+1. **+ New → Storage → Bucket** in your Railway project.
+2. From the bucket's **Variables**/**Connect** tab, copy its endpoint, bucket name, access key,
+   and secret key into the `S3_*` variables below.
+3. Set those variables on **both** the web and worker services.
 
-Leave `SCRATCH_DIR` on its default (local, ephemeral `/tmp`) — it's only used mid-job for
-downloaded source video and extracted frames, which are deleted again as soon as that job
-finishes, so it never needs to be shared or to persist.
+The worker uploads each rendered clip straight to the bucket (`src/storage/s3.ts`); the web
+service serves it back by redirecting to a short-lived presigned URL (`src/storage/index.ts` picks
+the S3 backend automatically whenever `S3_BUCKET` is set — see `src/storage/` for the full
+local-vs-S3 abstraction). Presigned URLs support HTTP Range requests on their own, so video
+seeking still works without the app proxying any bytes itself.
+
+Leave `SCRATCH_DIR` on its default (local, ephemeral `/tmp`) on both services — it's only used
+mid-job for downloaded source video and extracted frames, deleted again as soon as that job
+finishes, so it never needs to be shared or to persist. `STORAGE_DIR` also stays on its default;
+it's only read when `S3_BUCKET` is unset (local development).
 
 ### 3. Environment variables
 
@@ -174,7 +186,11 @@ services via a shared variable group, or just paste the same values twice):
 | `ANTHROPIC_API_KEY` | your Anthropic key |
 | `YOUTUBE_API_KEY` | your YouTube Data API v3 key |
 | `APP_PASSWORD` | a password of your choosing, to gate the dashboard |
-| `STORAGE_DIR` | `/data/storage` (see above) |
+| `S3_BUCKET` | your Storage Bucket's name |
+| `S3_ENDPOINT` | your Storage Bucket's endpoint URL |
+| `S3_ACCESS_KEY_ID` | your Storage Bucket's access key |
+| `S3_SECRET_ACCESS_KEY` | your Storage Bucket's secret key |
+| `S3_REGION` | your Storage Bucket's region if it has one; otherwise leave unset (defaults to `auto`) |
 
 `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` can be left unset for now — Reddit starts out disabled
 (see below) and only needs credentials once you enable it from the Sources page.
