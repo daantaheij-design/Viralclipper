@@ -22,8 +22,6 @@ export interface ProcessingRunSummary {
   failed: number;
 }
 
-const RENDER_BATCH_LIMIT = 25;
-
 export async function runProcessing(): Promise<ProcessingRunSummary> {
   const settings = await getSettings();
 
@@ -33,7 +31,7 @@ export async function runProcessing(): Promise<ProcessingRunSummary> {
       status: "moment_found",
     },
     orderBy: { viralScore: "desc" },
-    take: RENDER_BATCH_LIMIT,
+    take: settings.maxRendersPerRun,
     include: { sourceVideo: { include: { source: true } } },
   });
 

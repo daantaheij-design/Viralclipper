@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { SESSION_COOKIE_NAME, isAuthRequired, verifySessionCookieValue } from "@/lib/auth";
 
-const PUBLIC_PATHS = new Set(["/login", "/api/auth/login", "/favicon.ico"]);
+const PUBLIC_PATHS = new Set(["/login", "/api/auth/login", "/api/health", "/favicon.ico"]);
 
 export function proxy(request: NextRequest) {
   if (!isAuthRequired()) return NextResponse.next();

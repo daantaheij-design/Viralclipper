@@ -131,6 +131,85 @@ In production, run both as long-lived processes (e.g. two services on Railway/Re
 processes under a process manager). This app is not designed for stateless serverless functions —
 video download/analysis/rendering are minutes-long, stateful, disk-using operations.
 
+## Deploying to Railway
+
+The repo ships a `Dockerfile` (Node 22 + ffmpeg + yt-dlp) and two Railway config-as-code files —
+`railway.json` (web service, the default Railway picks up) and `railway.worker.json` (worker
+service, point a second service at this file explicitly). Both services build from the same
+Dockerfile/image; only the start command differs.
+
+### 1. Create the project
+
+1. New Railway project → **Deploy from GitHub repo** → this repo. This becomes your **web**
+   service; Railway auto-detects `railway.json` (Dockerfile build, `npm run start`, health check
+   at `/api/health`).
+2. **+ New → Database → PostgreSQL.** Railway provisions it and exposes a `DATABASE_URL`
+   reference variable other services in the project can consume.
+3. **+ New → GitHub repo** again, same repo, to create the **worker** service. In its
+   Settings → **Config-as-code**, set the file path to `railway.worker.json` so it runs
+   `npm run start:worker` instead of the web server.
+
+### 2. Shared storage volume
+
+The worker renders 9:16 clips to local disk; the web service's `/api/media/[momentId]` route (the
+preview player and "Download 9:16" button) reads them back — but web and worker are **separate
+containers**, so local disk isn't shared between them unless you attach a volume to both:
+
+1. On the **worker** service: Settings → **Volumes** → create a volume, mount path `/data/storage`.
+2. Attach that **same volume** to the **web** service too, same mount path `/data/storage`.
+3. Set `STORAGE_DIR=/data/storage` as a variable on **both** services.
+
+Leave `SCRATCH_DIR` on its default (local, ephemeral `/tmp`) — it's only used mid-job for
+downloaded source video and extracted frames, which are deleted again as soon as that job
+finishes, so it never needs to be shared or to persist.
+
+### 3. Environment variables
+
+Set these on **both** the web and worker services (Railway lets you share a variable across
+services via a shared variable group, or just paste the same values twice):
+
+| Variable | Value |
+| --- | --- |
+| `DATABASE_URL` | reference the Postgres service's `DATABASE_URL` |
+| `ANTHROPIC_API_KEY` | your Anthropic key |
+| `YOUTUBE_API_KEY` | your YouTube Data API v3 key |
+| `APP_PASSWORD` | a password of your choosing, to gate the dashboard |
+| `STORAGE_DIR` | `/data/storage` (see above) |
+
+`REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` can be left unset for now — Reddit starts out disabled
+(see below) and only needs credentials once you enable it from the Sources page.
+
+### 4. Migrations
+
+Both `railway.json` and `railway.worker.json` start commands run `npx prisma migrate deploy`
+before starting their actual process. This is safe to run from both services on every deploy —
+Prisma's migration runner takes a database-level lock, so if both containers start at once, one
+just waits its turn instead of racing.
+
+### 5. First live test — production-safe by default
+
+A fresh database's `Settings` start out deliberately narrow (`src/database/settings.ts`
+`DEFAULT_SETTINGS`), and `npm run db:seed`/the worker's own startup seeding only enables the
+YouTube source, so the very first run is small on purpose:
+
+- Source: **YouTube only** (Reddit seeded as disabled)
+- Category: **Road Rage only**
+- Candidates per discovery run: **20**
+- Quick scans per run: **5**
+- Detailed analyses per run: **2**
+- 9:16 renders per run: **2**
+
+That's the whole pipeline exercised end to end — YouTube search → download (yt-dlp) → frame
+extraction (ffmpeg) → Claude vision (quick scan, then detailed analysis) → start/peak/end
+timestamps + viral score → smart-cropped ffmpeg 9:16 render → visible on the dashboard — without
+risking a large AI/API bill on the first deploy. Once you've confirmed a clip makes it all the way
+through, raise the limits and enable more categories/sources from the **Settings** page; nothing
+about that verification changes what's safe to raise later.
+
+To kick off that first run immediately instead of waiting for the worker's next scheduled tick,
+open the dashboard and click **Run discovery now**, or watch the worker service's logs — it ticks
+every 5 minutes and logs each stage (`[worker] running discovery` / `analysis` / `processing`).
+
 ## Testing
 
 ```bash

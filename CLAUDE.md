@@ -65,6 +65,17 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   functions. The existing suppressions in `MomentFeed.tsx`/`SourcesPanel.tsx` are deliberate, not
   oversights — prefer restructuring to avoid the impure call (see `SettingsForm.tsx`'s `saved`
   boolean instead of a `Date.now()` timestamp) over blanket-disabling the rule.
+- **`tsx` and `prisma` (the CLI) live in `dependencies`, not `devDependencies`**, even though
+  they're normally dev tools — the worker service in production runs `tsx src/worker/index.ts`
+  directly (no bundling step for the worker, unlike the web app which `next build` compiles), and
+  both services' Railway start commands run `npx prisma migrate deploy`. Don't move them back
+  without also changing how the worker runs in production.
+- **`DEFAULT_SETTINGS` in `src/database/settings.ts` and `seedSources()` in `src/database/seed.ts`
+  are deliberately conservative** (YouTube only, Road Rage only, small per-run caps) — that's the
+  safe first-deploy configuration, not a permanent product decision. They only take effect on a
+  fresh database with no `AppSetting`/`Source` rows yet; changing them doesn't affect an existing
+  deployment that's already saved its own settings. Raise the numbers from the Settings page, not
+  by editing these defaults, once a real deployment has been verified end to end.
 
 ## Local development
 
@@ -94,3 +105,12 @@ No test suite is checked in yet. If you add one, follow the existing project's l
 (`road-rage-clipper`, a sibling project) of mocking external APIs (Anthropic/YouTube/Reddit) in
 HTTP-layer tests and only running real ffmpeg for filter-graph-correctness tests — never call
 paid APIs from tests.
+
+## Deployment
+
+`Dockerfile` + `railway.json` (web) + `railway.worker.json` (worker) are Railway-specific but
+generic enough to adapt to any container platform — see README.md's "Deploying to Railway"
+section for the full walkthrough, including why the web and worker services need a **shared**
+storage volume (the worker renders files the web service's `/api/media/` route serves, but they're
+separate containers) and why both services' start commands run `prisma migrate deploy` before
+their actual process.
