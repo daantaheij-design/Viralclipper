@@ -3,6 +3,7 @@ import { prisma } from "@/database/client";
 import { seedSources } from "@/database/seed";
 import { getSettings } from "@/database/settings";
 import { logError } from "@/lib/errorLog";
+import { runStartupSelfTest } from "@/lib/selfTest";
 import { runDiscoveryJob } from "@/jobs/discovery";
 import { runAnalysis } from "@/jobs/analysis";
 import { runProcessing } from "@/jobs/processing";
@@ -48,6 +49,7 @@ async function tick(): Promise<void> {
 }
 
 async function main() {
+  await runStartupSelfTest();
   await seedSources();
   console.log(`[worker] starting — tick schedule "${TICK_CRON}"`);
 

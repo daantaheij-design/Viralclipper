@@ -50,6 +50,24 @@ export const env = {
   ffprobePath: optional("FFPROBE_PATH") ?? "ffprobe",
 
   ffmpegThreads: Number(optional("FFMPEG_THREADS") ?? "2"),
+
+  // Minimum spacing, in ms, enforced between successive yt-dlp media
+  // acquisitions (see src/video/acquisitionThrottle.ts) — this is about
+  // pacing requests to YouTube itself, deliberately separate from
+  // FFMPEG_THREADS (ffmpeg's own CPU thread cap). Default 5s: cheap
+  // insurance against looking like a script hammering YouTube.
+  youtubeAcquisitionDelayMs: Number(optional("YOUTUBE_ACQUISITION_DELAY_MS") ?? "5000"),
+
+  // How many consecutive access-blocked results (429 / bot-check /
+  // login-required) within one discovery/render run before that run gives
+  // up on further YouTube acquisitions rather than continuing to work
+  // through its remaining candidates — see AcquisitionCircuitBreaker.
+  youtubeCircuitBreakerThreshold: Number(optional("YOUTUBE_CIRCUIT_BREAKER_THRESHOLD") ?? "3"),
+
+  // Optional, entirely optional: a yt-dlp cookies.txt (Netscape format),
+  // base64-encoded, for authenticated YouTube access. Never required to
+  // start the app. See src/video/ytdlpCookies.ts — never logged.
+  ytdlpCookiesBase64: optional("YTDLP_COOKIES_BASE64"),
 };
 
 export function requireAnthropicKey(): string {

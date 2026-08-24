@@ -21,7 +21,14 @@ src/
     pricing.ts            Approximate $/token pricing for the cost dashboard
     costTracking.ts        Records every AI call as an ApiUsage row + daily budget check
   video/
-    ytdlp.ts               Downloads source video (yt-dlp)
+    acquire.ts               Media-acquisition provider abstraction — routes each source's
+                              VideoAvailability to yt-dlp or a plain HTTP download; the only
+                              thing jobs/ should call to get bytes onto local disk
+    acquisitionErrors.ts       Classifies a failure as rate_limited / bot_check / login_required /
+                                binary_missing / ffmpeg_missing / unknown (pure, unit-tested)
+    acquisitionThrottle.ts     Pacing between yt-dlp calls + AcquisitionCircuitBreaker
+    ytdlp.ts                    The yt-dlp invocation itself (--js-runtimes node, cookies)
+    ytdlpCookies.ts               Optional authenticated access — see "Media acquisition" below
     ffmpeg.ts               probe / extractFrames wrappers
     smartCrop.ts             Subject bounding boxes -> smoothed 9:16 pan keyframes (no zoom,
                               no artificial camera movement)
@@ -39,6 +46,7 @@ src/
     index.ts                 Long-running scheduler (node-cron) — the primary driver
     runOnce.ts                 One-shot pipeline run (`npm run worker:once`)
   database/               Prisma client, typed settings store, moment queries
+    acquisitionCooldown.ts   Exponential backoff for a source that's actively blocking us
   storage/                Where rendered clips live — local disk or S3-compatible object
                            storage (index.ts picks the backend; see "Deploying to Railway")
   app/                    Next.js dashboard (App Router) + JSON API routes
@@ -60,6 +68,54 @@ Claude vision only ever looks at videos that pass that filter (quick scan), and 
 densely inside windows the quick scan already flagged (detailed analysis). All of this is
 configurable from **Settings** (candidates/quick-scans/detailed-analyses per run, minimum viral
 score, daily AI budget).
+
+### Media acquisition: being discovered ≠ being downloadable
+
+Discovery (finding a video via the YouTube Data API or Reddit's API) and media acquisition
+(actually fetching that video's bytes) are deliberately separate concerns — a video the YouTube
+API happily returns is not guaranteed to be fetchable by yt-dlp from wherever this app happens to
+be hosted. In production this isn't hypothetical: YouTube actively rate-limits and bot-challenges
+requests from datacenter IPs (Railway included), independent of anything about the video itself.
+
+- **`src/video/acquire.ts`** is the only place `jobs/analysis.ts`/`jobs/processing.ts` go to turn
+  a discovered video into local bytes. It's a small provider abstraction: a source's
+  `VideoAvailability.acquisitionMethod` says whether to use yt-dlp (YouTube; most Reddit-hosted
+  videos, which split audio/video into separate streams yt-dlp merges) or a plain HTTP download
+  (a Reddit post that links straight at an `.mp4`/`.mov`/`.webm` — no extractor, and no
+  yt-dlp/YouTube-style blocking risk at all for that path). Adding a source with directly
+  permitted media URLs means implementing `VideoSource` and setting `acquisitionMethod:
+  "direct-http"` on its `VideoAvailability` — nothing about acquisition needs to change.
+- **`src/video/acquisitionErrors.ts`** classifies a yt-dlp failure into `rate_limited` (HTTP 429),
+  `bot_check` ("Sign in to confirm you're not a bot"), `login_required`, `binary_missing`
+  (yt-dlp itself isn't on PATH), `ffmpeg_missing`, or `unknown`. The first three are treated as
+  the *source* actively refusing us, not an ordinary per-video failure.
+- On an access-blocked result, the source video's status becomes `source_access_blocked` (not the
+  generic `error`) with the reason stored, and it's scheduled for another attempt only after an
+  exponential-backoff cooldown (`src/database/acquisitionCooldown.ts`: 30min, 1h, 2h, ... capped
+  at 24h) — never immediately on the next 5-minute worker tick. The discovered row itself (title,
+  URL, metadata, and any moments already found before acquisition started failing) is left alone;
+  only the processing/render status is affected, and the pipeline moves on to the next candidate.
+- **`src/video/acquisitionThrottle.ts`** enforces a minimum delay between yt-dlp calls
+  (`YOUTUBE_ACQUISITION_DELAY_MS`, default 5s — acquisitions are already sequential by
+  construction, this just paces them) and an `AcquisitionCircuitBreaker`: after
+  `YOUTUBE_CIRCUIT_BREAKER_THRESHOLD` (default 3) *consecutive* access-blocked results within one
+  discovery or render run, that run stops trying further candidates instead of working through
+  dozens of doomed requests in seconds.
+- **Do not assume yt-dlp will always work.** This is the load-bearing production assumption to
+  avoid — see requirement 6 in the PR that added this section. The system is built to degrade
+  gracefully: a blocked video doesn't crash the run, doesn't get retried immediately, and doesn't
+  stop other candidates (or other sources) from being processed.
+
+**Optional authenticated access** (`YTDLP_COOKIES_BASE64`, `src/video/ytdlpCookies.ts`): a
+base64-encoded yt-dlp `cookies.txt`, entirely optional — the app starts and runs identically
+without it. This is a fallback, not a production strategy: the account it belongs to can itself
+get rate-limited or flagged, and cookies expire. Never hardcode cookies/credentials, and this is
+never logged (only whether one is configured, never its content).
+
+**Startup self-test** (`src/lib/selfTest.ts`): both `npm run start` and `npm run start:worker` log
+yt-dlp/ffmpeg/Node versions and whether a `node` binary is resolvable (the same thing yt-dlp's
+`--js-runtimes node` needs to find) once at boot — check a service's logs after deploying to
+confirm the video pipeline is actually usable in that container. No secrets are ever included.
 
 ### Why a separate `worker` process
 
@@ -247,19 +303,30 @@ every 5 minutes and logs each stage (`[worker] running discovery` / `analysis` /
 ```bash
 npm run typecheck   # runs `next typegen` first, then tsc --noEmit
 npx eslint .        # lint
+npm test             # node:test via tsx, no framework dependency — src/**/*.test.ts
 npm run build        # production build
 ```
 
-There is no synthetic-video/ffmpeg integration test suite yet (unlike a project with committed
-sample media, this repo has none checked in) — `video/renderVertical.ts`'s actual ffmpeg
-filter-graph output should be spot-checked against a real clip before relying on it, the same way
+The test suite covers the pure/classification logic directly (`node:test`, colocated
+`*.test.ts` files, no separate framework — `tsx` is already a dependency): acquisition failure
+classification (429, bot-check, LOGIN_REQUIRED, ENOENT for both yt-dlp and ffmpeg, an unrelated
+failure staying `unknown`) in `src/video/acquisitionErrors.test.ts` and `src/lib/proc.test.ts`
+(the latter against real fake-binary child processes, not mocks), the circuit breaker in
+`src/video/acquisitionThrottle.test.ts`, and the exponential-backoff math in
+`src/database/acquisitionCooldown.test.ts`.
+
+There is no synthetic-video/ffmpeg integration test suite (unlike a project with committed sample
+media, this repo has none checked in) — `video/renderVertical.ts`'s actual ffmpeg filter-graph
+output should be spot-checked against a real clip before relying on it, the same way
 `smartCrop.ts`'s pan math should be sanity-checked against a real moment with two tracked
 subjects. **`ffmpeg`/`ffprobe`/`yt-dlp` were not available in the sandbox this project was built
 in**, so the video pipeline (download, frame extraction, smart-crop render) is implemented and
-typechecked but has not been run end-to-end against real binaries — verify it in an environment
-with those installed before relying on it. Everything else (discovery, dedup, scoring math, API
-routes, dashboard) has been exercised against a real local Postgres database and a running dev
-server, including a full visual pass over the UI.
+typechecked but has not been run end-to-end against real binaries or real YouTube — verify it in
+a deployed environment before relying on it. Everything else (discovery, dedup, scoring math, API
+routes, dashboard, the direct-http acquisition path, the self-test's graceful handling of missing
+binaries) has been exercised for real — against a real local Postgres database, a running dev/prod
+server, a real local HTTP server standing in for a direct-media source, and this sandbox's own
+genuinely-missing yt-dlp/ffmpeg (a real instance of the "gracefully degrade" case).
 
 ## Adding a new source
 

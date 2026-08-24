@@ -12,6 +12,7 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
     "worker": "tsx watch src/worker/index.ts",
     "worker:once": "tsx src/worker/runOnce.ts",
     "start:worker": "tsx src/worker/index.ts",
