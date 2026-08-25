@@ -40,6 +40,19 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   (`src/lib/errorLog.ts`) rather than throwing out of the pipeline — one bad video must never stop
   the rest of a discovery/analysis run. Preserve that per-item isolation if you restructure
   `jobs/analysis.ts` or `jobs/processing.ts`.
+- **`jobs/analysis.ts` and `jobs/processing.ts` must always fetch video bytes via
+  `src/video/acquire.ts::acquireVideo()`, never `ytdlp.ts::downloadVideo()` directly.** That's
+  what applies pacing (`acquisitionThrottle.ts`) and turns a raw yt-dlp failure into a classified
+  `AcquisitionError` (`acquisitionErrors.ts`) the job loop can branch on — a 429/bot-check/
+  login-required must become `source_access_blocked` + a cooldown
+  (`database/acquisitionCooldown.ts`), never an ordinary retry-next-tick `error`. See README's
+  "Media acquisition" section for the full story; this is a production-observed failure mode
+  (Railway's IP getting rate-limited/challenged by YouTube), not speculative hardening — don't
+  relax it without re-reading why it's there.
+- **Never assume yt-dlp will work.** Any change that adds a new place video bytes are fetched from
+  a yt-dlp-backed source must go through `acquire.ts`, and must handle `AcquisitionError` the same
+  way the existing job loops do (blocked → cooldown + move on; missing binary → abort the run,
+  don't burn through the rest of the batch identically failing).
 
 ## Stack-specific gotchas
 
@@ -98,13 +111,20 @@ built in one) — verify the video pipeline for real before relying on it.
 ```bash
 npm run typecheck
 npx eslint .
+npm test          # node:test via tsx — no framework dependency, see package.json
 npm run build
 ```
 
-No test suite is checked in yet. If you add one, follow the existing project's lead
-(`road-rage-clipper`, a sibling project) of mocking external APIs (Anthropic/YouTube/Reddit) in
-HTTP-layer tests and only running real ffmpeg for filter-graph-correctness tests — never call
-paid APIs from tests.
+`npm test` runs `tsx --test src/**/*.test.ts` — Node's built-in test runner, chosen specifically
+to avoid adding a test-framework dependency (`tsx` was already a dependency for the worker). Keep
+new tests colocated as `<name>.test.ts` next to the code they cover, matching
+`src/video/acquisitionErrors.test.ts` / `src/lib/proc.test.ts` / etc. Prefer pure functions you
+can unit-test directly (like `classifyYtDlpStderr`) over mocking; where a real child process is
+cheap and deterministic (like `proc.test.ts` does with tiny fake shell scripts), exercise it for
+real rather than mocking `child_process`. Follow the existing project's lead (`road-rage-clipper`,
+a sibling project) of mocking external APIs (Anthropic/YouTube/Reddit HTTP calls) in any future
+HTTP-layer tests and only running real ffmpeg for filter-graph-correctness tests — never call paid
+APIs from tests.
 
 ## Deployment
 

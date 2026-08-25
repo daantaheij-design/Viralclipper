@@ -46,6 +46,12 @@ enum VideoProcessingStatus {
   scanning
   scanned
   no_candidates
+  // The source (e.g. YouTube) actively refused media acquisition — 429,
+  // a bot/CAPTCHA challenge, or a sign-in requirement — as opposed to a
+  // generic/transient `error`. Distinct so the pipeline backs off instead
+  // of hammering the source again on the next tick; see
+  // src/database/acquisitionCooldown.ts.
+  source_access_blocked
   error
 }
 
@@ -194,6 +200,13 @@ model SourceVideo {
   status            VideoProcessingStatus  @default(discovered)
   errorMessage      String?
 
+  // Backoff state for `source_access_blocked` — see
+  // src/database/acquisitionCooldown.ts. accessFailureCount drives
+  // exponential backoff; nextRetryAt is when this video becomes eligible
+  // for another acquisition attempt again. Both no-ops for any other status.
+  accessFailureCount Int                   @default(0)
+  nextRetryAt       DateTime?
+
   titleFingerprint  String?                // normalized-title hash, for cheap dedup
 
   analysisJobs      AnalysisJob[]
@@ -203,6 +216,7 @@ model SourceVideo {
 
   @@unique([sourceId, sourceVideoId])
   @@index([status])
+  @@index([status, nextRetryAt])
   @@index([category])
   @@index([titleFingerprint])
   @@map("source_videos")

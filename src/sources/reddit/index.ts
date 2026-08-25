@@ -117,10 +117,18 @@ export const redditSource: VideoSource = {
     const post = data.data.children[0]?.data;
     if (!post) return { downloadable: false, url: "", reason: "post not found" };
     if (post.media?.reddit_video) {
-      return { downloadable: true, url: `https://www.reddit.com${post.permalink}` };
+      // v.redd.it splits audio/video into separate streams — needs yt-dlp
+      // to extract and merge them, a plain GET on the permalink won't work.
+      return {
+        downloadable: true,
+        url: `https://www.reddit.com${post.permalink}`,
+        acquisitionMethod: "yt-dlp",
+      };
     }
     if (/\.(mp4|mov|webm)(\?|$)/i.test(post.url)) {
-      return { downloadable: true, url: post.url };
+      // A direct link straight to a media file — no extractor needed, and
+      // no yt-dlp/YouTube-style rate-limiting risk either.
+      return { downloadable: true, url: post.url, acquisitionMethod: "direct-http" };
     }
     return {
       downloadable: false,

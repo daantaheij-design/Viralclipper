@@ -1,9 +1,12 @@
 import path from "node:path";
 import { prisma } from "@/database/client";
 import { getSettings } from "@/database/settings";
+import { acquisitionEligible, markSourceVideoAccessBlocked } from "@/database/acquisitionCooldown";
 import { getSource } from "@/sources/registry";
 import { probeVideo } from "@/video/ffmpeg";
-import { downloadVideo } from "@/video/ytdlp";
+import { acquireVideo } from "@/video/acquire";
+import { AcquisitionError } from "@/video/acquisitionErrors";
+import { AcquisitionCircuitBreaker } from "@/video/acquisitionThrottle";
 import { computeSmartCropKeyframes } from "@/video/smartCrop";
 import { claudeVisionTracker } from "@/video/objectTracking";
 import { renderVerticalClip } from "@/video/renderVertical";
@@ -21,13 +24,21 @@ export interface ProcessingRunSummary {
   failed: number;
 }
 
+interface RenderOneMomentResult {
+  rendered: boolean;
+  wasAccessBlocked: boolean;
+  environmentBroken: boolean;
+}
+
 export async function runProcessing(): Promise<ProcessingRunSummary> {
   const settings = await getSettings();
+  const now = new Date();
 
   const moments = await prisma.detectedMoment.findMany({
     where: {
       viralScore: { gte: settings.minViralScore },
       status: "moment_found",
+      sourceVideo: acquisitionEligible(now),
     },
     orderBy: { viralScore: "desc" },
     take: settings.maxRendersPerRun,
@@ -37,16 +48,39 @@ export async function runProcessing(): Promise<ProcessingRunSummary> {
   let rendered = 0;
   let failed = 0;
 
+  // Sequential, one render at a time — see acquisitionThrottle.ts.
+  const circuitBreaker = new AcquisitionCircuitBreaker();
+
   for (const moment of moments) {
-    const ok = await renderOneMoment(moment);
-    if (ok) rendered++;
+    const result = await renderOneMoment(moment);
+    if (result.rendered) rendered++;
     else failed++;
+
+    if (result.environmentBroken) {
+      await logError(
+        "render",
+        "Stopping this render run early: the media-acquisition environment (yt-dlp/ffmpeg) is unusable, so the remaining moments would fail identically",
+      );
+      break;
+    }
+
+    if (!result.wasAccessBlocked) {
+      circuitBreaker.recordNotBlocked();
+      continue;
+    }
+    if (circuitBreaker.recordBlocked()) {
+      await logError(
+        "render",
+        "Stopping this render run early: repeated access-blocked results suggest this environment's IP is currently blocked by the source",
+      );
+      break;
+    }
   }
 
   return { rendered, failed };
 }
 
-async function renderOneMoment(moment: MomentWithVideo): Promise<boolean> {
+async function renderOneMoment(moment: MomentWithVideo): Promise<RenderOneMomentResult> {
   const scratchDir = scratchDirForRender(moment.id);
 
   await prisma.detectedMoment.update({ where: { id: moment.id }, data: { status: "tiktok_processing" } });
@@ -61,10 +95,38 @@ async function renderOneMoment(moment: MomentWithVideo): Promise<boolean> {
     const availability = await source.getVideoSource(moment.sourceVideo.sourceVideoId);
     if (!availability.downloadable) {
       await markUnavailable(moment.id, tikTokVersion.id, availability.reason);
-      return false;
+      return { rendered: false, wasAccessBlocked: false, environmentBroken: false };
     }
 
-    const filePath = await downloadVideo(availability.url, scratchDir);
+    let filePath: string;
+    try {
+      filePath = await acquireVideo(availability, scratchDir);
+    } catch (err) {
+      if (!(err instanceof AcquisitionError)) throw err;
+      const { classification } = err;
+
+      if (classification.kind === "binary_missing" || classification.kind === "ffmpeg_missing") {
+        await markFailed(moment.id, tikTokVersion.id, classification.message, "error");
+        await logError("render", `Media-acquisition environment problem for moment ${moment.id}`, err, {
+          momentId: moment.id,
+        });
+        return { rendered: false, wasAccessBlocked: false, environmentBroken: true };
+      }
+
+      if (classification.isAccessBlocked) {
+        await markSourceVideoAccessBlocked(moment.sourceVideo.id, classification.message);
+        // Not "error" — this moment is still good, just temporarily
+        // unreachable. Back to moment_found so it's retried once the
+        // source video's cooldown (see acquisitionCooldown.ts) elapses.
+        await markFailed(moment.id, tikTokVersion.id, classification.message, "moment_found");
+        return { rendered: false, wasAccessBlocked: true, environmentBroken: false };
+      }
+
+      await markFailed(moment.id, tikTokVersion.id, classification.message, "error");
+      await logError("render", `Media acquisition failed for moment ${moment.id}`, err, { momentId: moment.id });
+      return { rendered: false, wasAccessBlocked: false, environmentBroken: false };
+    }
+
     const info = await probeVideo(filePath);
 
     const tracked = claudeVisionTracker.track({ rawKeyframes: moment.trackedKeyframes });
@@ -104,15 +166,11 @@ async function renderOneMoment(moment: MomentWithVideo): Promise<boolean> {
       },
     });
     await prisma.detectedMoment.update({ where: { id: moment.id }, data: { status: "ready" } });
-    return true;
+    return { rendered: true, wasAccessBlocked: false, environmentBroken: false };
   } catch (err) {
     await logError("render", `Render failed for moment ${moment.id}`, err, { momentId: moment.id });
-    await prisma.tikTokVersion.update({
-      where: { id: tikTokVersion.id },
-      data: { status: "failed", errorMessage: err instanceof Error ? err.message : String(err) },
-    });
-    await prisma.detectedMoment.update({ where: { id: moment.id }, data: { status: "error" } });
-    return false;
+    await markFailed(moment.id, tikTokVersion.id, err instanceof Error ? err.message : String(err), "error");
+    return { rendered: false, wasAccessBlocked: false, environmentBroken: false };
   } finally {
     await cleanupScratchDir(scratchDir);
   }
@@ -124,4 +182,17 @@ async function markUnavailable(momentId: string, tikTokVersionId: string, reason
     data: { status: "unavailable", errorMessage: reason ?? "Source no longer downloadable" },
   });
   await prisma.detectedMoment.update({ where: { id: momentId }, data: { status: "ready" } });
+}
+
+async function markFailed(
+  momentId: string,
+  tikTokVersionId: string,
+  errorMessage: string,
+  momentStatus: "error" | "moment_found",
+): Promise<void> {
+  await prisma.tikTokVersion.update({
+    where: { id: tikTokVersionId },
+    data: { status: "failed", errorMessage },
+  });
+  await prisma.detectedMoment.update({ where: { id: momentId }, data: { status: momentStatus } });
 }

@@ -119,6 +119,7 @@ export const youtubeSource: VideoSource = {
     return {
       downloadable: true,
       url: `https://www.youtube.com/watch?v=${sourceVideoId}`,
+      acquisitionMethod: "yt-dlp",
     };
   },
 

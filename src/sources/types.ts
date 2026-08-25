@@ -21,11 +21,24 @@ export interface VideoStats {
   commentCount?: number;
 }
 
+/**
+ * How to actually fetch the bytes at `VideoAvailability.url`:
+ * - "yt-dlp": needs extraction (YouTube, and most Reddit-hosted videos,
+ *   which split audio/video into separate streams yt-dlp merges).
+ * - "direct-http": the URL already points straight at a media file a plain
+ *   HTTP GET can fetch — no extractor, and importantly no yt-dlp-specific
+ *   rate limiting/blocking risk. Some Reddit posts link directly to an
+ *   .mp4/.mov/.webm this way.
+ * Sources that don't set this are treated as "yt-dlp" (the common case).
+ */
+export type AcquisitionMethod = "yt-dlp" | "direct-http";
+
 /** Whether we're able to fetch bytes for a video (for frame extraction / rendering). */
 export interface VideoAvailability {
   downloadable: boolean;
   url: string;
   reason?: string;
+  acquisitionMethod?: AcquisitionMethod;
 }
 
 export interface SearchOptions {
