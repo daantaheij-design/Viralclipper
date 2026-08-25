@@ -2,6 +2,7 @@ import { prisma } from "@/database/client";
 import { getSettings } from "@/database/settings";
 import { getSource } from "@/sources/registry";
 import { computePreliminaryScore } from "./candidateScoring";
+import { computeCategoryPrefilter } from "./categoryPrefilter";
 import { checkDuplicate, titleFingerprint } from "./deduplication";
 import { markQueryUsed, pickQueriesForRun } from "./queryGenerator";
 import { logError } from "@/lib/errorLog";
@@ -14,6 +15,7 @@ export interface DiscoveryRunSummary {
   candidatesFound: number;
   uniqueCandidates: number;
   duplicatesSkipped: number;
+  rejectedByCategory: number;
 }
 
 export async function runDiscovery(): Promise<DiscoveryRunSummary> {
@@ -26,6 +28,7 @@ export async function runDiscovery(): Promise<DiscoveryRunSummary> {
   let uniqueCandidates = 0;
   let duplicatesSkipped = 0;
   let queriesUsed = 0;
+  let rejectedByCategoryCount = 0;
 
   try {
     const sources = await prisma.source.findMany({ where: { enabled: true } });
@@ -73,6 +76,8 @@ export async function runDiscovery(): Promise<DiscoveryRunSummary> {
             }
 
             const { score, viewVelocity } = computePreliminaryScore(video, query.category);
+            const prefilter = computeCategoryPrefilter(video, query.category);
+            const rejectedByCategory = prefilter.score < settings.minPreCategoryRelevanceScore;
 
             try {
               const created = await prisma.sourceVideo.create({
@@ -96,9 +101,16 @@ export async function runDiscovery(): Promise<DiscoveryRunSummary> {
                   preliminaryScore: score,
                   viewVelocity,
                   titleFingerprint: titleFingerprint(video.title),
+                  preCategoryRelevanceScore: prefilter.score,
+                  categoryPrefilterReason: prefilter.reason,
+                  // Rejected here, before acquisition, before any Anthropic
+                  // call — see src/discovery/categoryPrefilter.ts and
+                  // requirement #5/#18 of the cost-control PR.
+                  status: rejectedByCategory ? "filtered_out" : "discovered",
                 },
               });
               uniqueCandidates++;
+              if (rejectedByCategory) rejectedByCategoryCount++;
               void created;
             } catch (err) {
               // Unique constraint hit (source, sourceVideoId) already seen
@@ -122,7 +134,7 @@ export async function runDiscovery(): Promise<DiscoveryRunSummary> {
         candidatesFound,
         uniqueCandidates,
         duplicatesSkipped,
-        stats: { categories, sourcesSearched: sources.map((s) => s.name) },
+        stats: { categories, sourcesSearched: sources.map((s) => s.name), rejectedByCategory: rejectedByCategoryCount },
       },
     });
   } catch (err) {
@@ -137,5 +149,11 @@ export async function runDiscovery(): Promise<DiscoveryRunSummary> {
     });
   }
 
-  return { discoveryRunId: run.id, candidatesFound, uniqueCandidates, duplicatesSkipped };
+  return {
+    discoveryRunId: run.id,
+    candidatesFound,
+    uniqueCandidates,
+    duplicatesSkipped,
+    rejectedByCategory: rejectedByCategoryCount,
+  };
 }

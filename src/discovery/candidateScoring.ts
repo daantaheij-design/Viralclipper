@@ -14,6 +14,23 @@ function logScore(value: number, saturateAt: number): number {
   return clamp(Math.log10(value + 1) / Math.log10(saturateAt + 1), 0, 1);
 }
 
+// Metadata-only, zero-cost signal of whether a video looks like raw/
+// minimally-edited source footage vs. an edited repost — pre-ranks
+// candidates BEFORE any acquisition/Anthropic spend (cost-control PR req
+// #4). Not a hard gate (that's src/analysis/sourceCleanliness.ts, which
+// looks at actual frames after acquisition) — just nudges priority order
+// so raw footage tends to reach the AI budget check first.
+const RAW_FOOTAGE_HINTS = ["dashcam", "dash cam", "bodycam", "body cam", "cctv", "raw footage", "full video", "original footage", "unedited"];
+const REPOST_HINTS = ["#shorts", "#tiktok", "#reels", "shorts", "tiktok", "reaction", "compilation", "repost", "reupload"];
+
+function formatPriorityDelta(video: DiscoveredVideo): number {
+  const haystack = `${video.title} ${video.description}`.toLowerCase();
+  let delta = 0;
+  if (RAW_FOOTAGE_HINTS.some((h) => haystack.includes(h))) delta += 0.15;
+  if (REPOST_HINTS.some((h) => haystack.includes(h))) delta -= 0.15;
+  return delta;
+}
+
 function keywordRelevance(video: DiscoveredVideo, category: Category): number {
   const haystack = `${video.title} ${video.description}`.toLowerCase();
   const keywords = new Set<string>();
@@ -85,8 +102,10 @@ export function computePreliminaryScore(
     relevanceComponent * 0.2 +
     durationComponent * 0.05;
 
+  const withFormatPriority = clamp(weighted + formatPriorityDelta(video), 0, 1);
+
   return {
-    score: Math.round(clamp(weighted, 0, 1) * 100),
+    score: Math.round(withFormatPriority * 100),
     viewVelocity,
   };
 }

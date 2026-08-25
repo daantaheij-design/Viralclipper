@@ -4,7 +4,7 @@ import { runAnalysis } from "./analysis";
 import { runProcessing } from "./processing";
 
 export interface PipelineRunResult {
-  discovery: Awaited<ReturnType<typeof runDiscoveryJob>>;
+  discovery: Awaited<ReturnType<typeof runDiscoveryJob>> | null;
   analysis: Awaited<ReturnType<typeof runAnalysis>> | null;
   processing: Awaited<ReturnType<typeof runProcessing>> | null;
 }

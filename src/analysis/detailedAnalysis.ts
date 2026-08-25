@@ -31,12 +31,19 @@ export interface DetailedAnalysisOutcome {
  * whether it's actually a viral moment, find its true start/peak/end, score
  * it, and report subject bounding boxes for smart cropping.
  */
+export interface DetailedAnalysisContext {
+  runToken: string;
+  sourceVideoId: string;
+  analysisJobId?: string;
+}
+
 export async function runDetailedAnalysis(
   videoFilePath: string,
   scratchDir: string,
   video: VideoInfo,
   category: Category,
   window: QuickScanWindow,
+  ctx: DetailedAnalysisContext,
 ): Promise<DetailedAnalysisOutcome> {
   const span = window.endSeconds - window.startSeconds;
   const fps = Math.min(DENSE_FPS, MAX_DENSE_FRAMES / Math.max(span, 1));
@@ -66,6 +73,9 @@ export async function runDetailedAnalysis(
         `Pass-1 flagged this window because: "${window.reason}".`,
       frames: frameInputs,
       operation: "detailed_analysis",
+      runToken: ctx.runToken,
+      sourceVideoId: ctx.sourceVideoId,
+      analysisJobId: ctx.analysisJobId,
       maxTokens: 4000,
     });
 

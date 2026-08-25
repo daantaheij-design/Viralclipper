@@ -17,9 +17,13 @@ src/
   discovery/           Query generation + rotation, cheap metadata scoring, deduplication,
                        runDiscovery.ts orchestrates one discovery run
   ai/
-    providers/claude.ts  Structured-output Claude vision calls (Zod schema, forced JSON)
-    pricing.ts            Approximate $/token pricing for the cost dashboard
-    costTracking.ts        Records every AI call as an ApiUsage row + daily budget check
+    providers/claude.ts  Structured-output Claude vision calls (Zod schema, forced JSON) — the
+                         ONLY place this app ever calls Anthropic, and so the single enforcement
+                         point for the budget gate below
+    budget.ts              Atomic AI-spend reservation (Postgres advisory lock) — the hard
+                            daily/per-run/concurrency spending gate; see "Cost control" below
+    pricing.ts            Approximate $/token pricing + pessimistic pre-call cost estimation
+    costTracking.ts        Records every AI call as an ApiUsage row (confirmed spend)
   video/
     acquire.ts               Media-acquisition provider abstraction — routes each source's
                               VideoAvailability to yt-dlp or a plain HTTP download; the only
@@ -35,18 +39,23 @@ src/
     objectTracking.ts         Swappable ObjectTracker interface (Claude-vision-derived by default)
     renderVertical.ts          ffmpeg crop+scale render — no captions, music, or effects, ever
   analysis/
+    sourceCleanliness.ts     Zero-Anthropic local gate: ffmpeg + pixel-level heuristics reject
+                              caption-heavy/overlay-heavy/split-screen sources before any AI cost
     quickScan.ts             Pass 1: sparse whole-video scan -> generously padded candidate windows
     detailedAnalysis.ts       Pass 2: dense scan of one window -> moment + scores + subject bboxes
     schemas.ts                 Zod schemas shared by both passes
   scoring/viralScore.ts      0-100 viral score = mean of the 11 sub-scores
   jobs/
-    discovery.ts / analysis.ts / processing.ts   One job per pipeline stage, persistence-aware
+    discovery.ts / analysis.ts / processing.ts   One job per pipeline stage, persistence-aware,
+                                                  each DB-locked against overlapping concurrent runs
     pipeline.ts                                    Runs all three stages end to end
   worker/
     index.ts                 Long-running scheduler (node-cron) — the primary driver
     runOnce.ts                 One-shot pipeline run (`npm run worker:once`)
   database/               Prisma client, typed settings store, moment queries
     acquisitionCooldown.ts   Exponential backoff for a source that's actively blocking us
+    jobLock.ts                 DB-backed mutex (atomic UPDATE...RETURNING) — one discovery run
+                                and one analysis batch at a time, across web + worker + replicas
   storage/                Where rendered clips live — local disk or S3-compatible object
                            storage (index.ts picks the backend; see "Deploying to Railway")
   app/                    Next.js dashboard (App Router) + JSON API routes
@@ -55,19 +64,86 @@ src/
 ### Pipeline
 
 ```
-DISCOVER (sources/*, discovery/) -> FILTER (candidateScoring, deduplication)
-  -> QUICK SCAN (analysis/quickScan.ts, sparse frames, cheap)
-  -> DETAILED ANALYSIS (analysis/detailedAnalysis.ts, dense frames on candidates only)
+DISCOVERY -> DEDUP -> METADATA FILTER -> CHEAP CATEGORY PREFILTER (metadata only, zero cost)
+  -> LOCAL SOURCE CLEANLINESS SCAN (ffmpeg + pixel heuristics, zero Anthropic cost)
+       -> DIRTY?  YES -> DIRTY_LEAD (kept as a lead, never sent to Anthropic)
+                  NO  -> continue
+  -> PRIORITY RANKING (raw footage boosted, reposts/reaction/compilation formats deprioritized)
+  -> AI BUDGET CHECK (atomic reservation — daily + per-run + concurrency, see below)
+  -> QUICK CLAUDE SCAN (analysis/quickScan.ts, sparse frames)
+  -> DETAILED CLAUDE ANALYSIS (analysis/detailedAnalysis.ts, dense frames on flagged windows only)
   -> VIRAL SCORE (scoring/viralScore.ts)
   -> 9:16 RENDER (video/renderVertical.ts, only for moments above the threshold)
   -> DASHBOARD
 ```
 
-Cost control is layered on purpose: cheap metadata scoring runs on every discovered video, but
-Claude vision only ever looks at videos that pass that filter (quick scan), and only re-analyzes
-densely inside windows the quick scan already flagged (detailed analysis). All of this is
-configurable from **Settings** (candidates/quick-scans/detailed-analyses per run, minimum viral
-score, daily AI budget).
+Anthropic is deliberately one of the **last**, most gated steps — not an early filter. See "Cost
+control" below for the full picture (this is a hard spending gate, not just a soft budget check).
+
+### Cost control: Anthropic is one of the last, most gated steps
+
+This exists because of a real production incident: a $5 Anthropic top-up was burned through in a
+single day. The cause was three compounding gaps, all fixed here — Claude was spending money on
+videos that were locally, cheaply, obviously unusable (caption-heavy edited Shorts, arrow/circle
+overlays — the actual moment could be genuinely good and Claude would still analyze the dirty
+source anyway); the daily budget check was a soft pre-check (`spent < budget`), not an atomic
+reservation, so nothing stopped several jobs/processes from each seeing "budget still OK" and all
+proceeding at once; and a large discovery backlog had no cap translating it into a bounded number
+of Claude calls.
+
+- **Local, zero-Anthropic gates run first.** `src/discovery/categoryPrefilter.ts` scores metadata
+  relevance and hard-rejects obviously-wrong topics (aviation, gaming, politics, podcasts,
+  workplace/customer-service/relationship/courtroom arguments) at discovery time, before
+  acquisition. `src/analysis/sourceCleanliness.ts` scores actual sampled frames (after
+  acquisition, still zero Anthropic cost) for burned-in captions, arrow/circle/graphic overlays,
+  and split-screen/reaction layouts — see its module docstring for exactly how (ffmpeg raw-frame
+  sampling + a grid-based sharp-and-static heuristic, no OpenCV/ML dependency). Both gates are
+  configurable thresholds in Settings (`minPreCategoryRelevanceScore`, `minSourceCleanlinessScore`
+  — default 70/75). A video that fails the cleanliness gate becomes `dirty_lead` (never
+  `filtered_out`/discarded): its score/flags/reason are persisted, plus
+  `suggestCleanSourceQueries()` — pure string suggestions for a cleaner version of the same
+  incident (no discovery API calls made automatically; that's a deliberate scope boundary for this
+  PR, not an oversight — see the funnel dashboard to review dirty leads yourself).
+- **The hard AI budget gate is atomic, not a soft pre-check.** `src/ai/budget.ts::reserveAiBudget`
+  is called from exactly one place — `analyzeFrames` (`src/ai/providers/claude.ts`), the *only*
+  place this app ever calls the Anthropic API — immediately before every request, and is the only
+  place that may create/settle a reservation. It runs inside a Postgres transaction holding
+  `pg_advisory_xact_lock`, so concurrent attempts from different processes (web + worker, or
+  multiple worker replicas) are genuinely serialized, not racing an in-memory counter: each
+  checks confirmed spend (today, from `ApiUsage`) + in-flight reserved spend + this call's
+  pessimistic pre-call cost estimate against the daily budget, the per-run budget, and the max
+  concurrent calls setting, before ever inserting a reservation row. A blocked call throws
+  `AiBudgetBlockedError` — callers must handle it explicitly (`instanceof`), never let it fall into
+  generic error handling — and no reservation, no ApiUsage row, and no Anthropic request happens.
+  After a real call, `commitReservation` reconciles the reservation with the actual token
+  usage/cost; on failure, `releaseReservation` frees it immediately. An abandoned reservation
+  (crashed process) stops counting after 10 minutes.
+- **`Paid AI Analysis` is a global kill switch** (`DiscoverySettings.paidAiAnalysisEnabled`,
+  defaults **OFF**) checked first, before the budget math — when off, `reserveAiBudget` blocks
+  every call unconditionally, from the worker, "Run discovery now", "Analyze Again", retries, and
+  source repair alike, since they all funnel through the same `analyzeFrames`. Discovery and every
+  local/free gate still run normally — only the Anthropic call itself is blocked.
+- **A missing `ANTHROPIC_API_KEY` doesn't retry-loop.** `reserveAiBudget` checks for the key before
+  ever attempting a call and blocks with `no_api_key`; `jobs/analysis.ts` turns that into a
+  `waiting_for_ai` `SourceVideo` status (not `error`) — the queue stays stable instead of failing
+  the same jobs every worker tick, and once the key is set and Paid AI Analysis is turned on,
+  eligible videos resume from there (cheap steps like acquisition/cleanliness redo; no Anthropic
+  cost was ever incurred, so there's nothing to resume from a checkpoint).
+- **One discovery run, one analysis batch, at a time.** `src/database/jobLock.ts` is a DB-backed
+  mutex (atomic `UPDATE ... WHERE ... RETURNING` compare-and-swap, no advisory lock needed since a
+  single SQL statement is already atomic) — `jobs/discovery.ts` and `jobs/analysis.ts` each take
+  their own named lock, so a worker tick can never overlap a manually-triggered run, and clicking
+  "Run discovery now" three times starts exactly one run (`POST /api/discovery/run` now awaits
+  discovery itself — a bounded number of search-API calls — so it can answer
+  `DISCOVERY_ALREADY_RUNNING` (409) synchronously and correctly for a duplicate click; analysis and
+  rendering, the genuinely multi-minute stages, still run in the background afterward). A lock held
+  past 30 minutes (a crashed holder) is treated as abandoned and can be reclaimed.
+- **The Settings/cost dashboard is the source of truth**, not just a display: it shows the full
+  discovery funnel (discovered → rejected by metadata/category/dirty-source → clean candidates →
+  sent to Anthropic → detailed analyses → good moments), confirmed vs. reserved/in-flight spend,
+  remaining budget, and a prominent `AI BUDGET REACHED — PAID ANALYSIS PAUSED` banner at 100%. Local
+  ffmpeg/CV processing cost is never mixed into the Anthropic spend numbers (local gates never
+  write an `ApiUsage` row).
 
 ### Media acquisition: being discovered ≠ being downloadable
 
@@ -327,23 +403,31 @@ instead of racing.
 
 ### 5. First live test — production-safe by default
 
-A fresh database's `Settings` start out deliberately narrow (`src/database/settings.ts`
-`DEFAULT_SETTINGS`), and `npm run db:seed`/the worker's own startup seeding only enables the
-YouTube source, so the very first run is small on purpose:
+A fresh database's `Settings` start out deliberately narrow and, as of the cost-control PR,
+**both automatic discovery and Paid AI Analysis start OFF** (`src/database/settings.ts`
+`DEFAULT_SETTINGS`) — nothing spends Anthropic money until you explicitly turn it on:
 
-- Source: **YouTube only** (Reddit seeded as disabled)
-- Category: **Road Rage only**
-- Candidates per discovery run: **20**
-- Quick scans per run: **5**
-- Detailed analyses per run: **2**
-- 9:16 renders per run: **2**
+- **Automatic discovery: OFF.** **Paid AI Analysis: OFF** (the global kill switch — see "Cost
+  control" above). Both need a manual flip in Settings.
+- Source: **YouTube only** (Reddit seeded as disabled). Category: **Road Rage only**.
+- Daily Anthropic budget: **$0.50**. Per-run Anthropic budget: **$0.20**. Max concurrent
+  Anthropic calls: **1**.
+- Candidates per discovery run: **20**. Quick scans / detailed analyses / 9:16 renders per run:
+  **1** each.
+- Min source cleanliness score: **75**. Min pre-category relevance score: **70**.
 
-That's the whole pipeline exercised end to end — YouTube search → download (yt-dlp) → frame
-extraction (ffmpeg) → Claude vision (quick scan, then detailed analysis) → start/peak/end
-timestamps + viral score → smart-cropped ffmpeg 9:16 render → visible on the dashboard — without
-risking a large AI/API bill on the first deploy. Once you've confirmed a clip makes it all the way
-through, raise the limits and enable more categories/sources from the **Settings** page; nothing
-about that verification changes what's safe to raise later.
+With discovery off, nothing happens until you either click **Run discovery now** (still safe —
+Paid AI Analysis stays off, so discovery/local filtering runs but zero Anthropic calls happen) or
+turn automatic discovery on. Once you've watched a few discovery runs populate the funnel on the
+Settings page (discovered → rejected by category/dirty-source → clean candidates) and you're
+ready to spend, turn **Paid AI Analysis** on — that's the one switch that actually allows an
+Anthropic call anywhere in the app. Raise the tiny per-run/daily budgets only after you've watched
+a real quick scan's actual cost land on the dashboard.
+
+That's the whole pipeline exercised end to end — YouTube search → local category/cleanliness
+gates → download (yt-dlp) → frame extraction (ffmpeg) → Claude vision (quick scan, then detailed
+analysis, budget-gated) → start/peak/end timestamps + viral score → smart-cropped ffmpeg 9:16
+render → visible on the dashboard — without risking a large AI/API bill on the first deploy.
 
 To kick off that first run immediately instead of waiting for the worker's next scheduled tick,
 open the dashboard and click **Run discovery now**, or watch the worker service's logs — it ticks
@@ -366,10 +450,28 @@ failure staying `unknown`) in `src/video/acquisitionErrors.test.ts` and `src/lib
 `src/video/acquisitionThrottle.test.ts`, and the exponential-backoff math in
 `src/database/acquisitionCooldown.test.ts`.
 
-There is no synthetic-video/ffmpeg integration test suite (unlike a project with committed sample
-media, this repo has none checked in) — `video/renderVertical.ts`'s actual ffmpeg filter-graph
-output should be spot-checked against a real clip before relying on it, the same way
-`smartCrop.ts`'s pan math should be sanity-checked against a real moment with two tracked
+`npm test` runs with `--test-concurrency=1` (see `package.json`) — deliberate, not accidental:
+node's test runner can execute multiple test files' top-level code concurrently within one
+process, and several files here mutate real, genuinely shared state (the single
+`discovery_settings` Postgres row via `updateSettings`, and in one budget test,
+`env.anthropicApiKey`) — running them concurrently produced real, reproducible cross-file test
+failures (one file's settings write landing mid-flight in another file's assertion). Don't remove
+this flag for speed without re-verifying the full suite passes repeatedly first.
+
+`src/analysis/sourceCleanliness.test.ts` and `src/analysis/quickScan.test.ts` **are** a real
+ffmpeg synthetic-video integration suite (no OpenCV/ML dependency; see
+`sourceCleanliness.ts`'s module docstring): frame content is generated pixel-by-pixel with a
+seeded PRNG rather than an ffmpeg `lavfi` source like `testsrc`/`mandelbrot`/`gradients` — all
+three turned out to have their own static calibration regions or non-reproducible-per-run content
+that produced flaky or misleading results when tried here, so don't reach for them as a shortcut
+without re-verifying determinism first. `src/ai/budget.test.ts` and `src/database/jobLock.test.ts`
+exercise real concurrent Postgres transactions (`Promise.all` racing several reservation/lock
+attempts) — per the cost-control PR's explicit requirement, the budget transaction logic is never
+mocked in these tests.
+
+`video/renderVertical.ts`'s actual ffmpeg filter-graph output should be spot-checked against a
+real clip before relying on it, the same way `smartCrop.ts`'s pan math should be sanity-checked
+against a real moment with two tracked
 subjects. **`ffmpeg`/`ffprobe`/`yt-dlp` were not available in the sandbox this project was built
 in**, so the video pipeline (download, frame extraction, smart-crop render) is implemented and
 typechecked but has not been run end-to-end against real binaries or real YouTube — verify it in

@@ -32,11 +32,18 @@ export interface QuickScanWindow {
  * time windows worth a closer (expensive) look. Frames are pulled in
  * batches so an hour-long video doesn't become one giant request.
  */
+export interface QuickScanContext {
+  runToken: string;
+  sourceVideoId: string;
+  analysisJobId?: string;
+}
+
 export async function runQuickScan(
   videoFilePath: string,
   scratchDir: string,
   video: VideoInfo,
   category: Category,
+  ctx: QuickScanContext,
 ): Promise<{ windows: QuickScanWindow[]; costUsd: number }> {
   const framesDir = path.join(scratchDir, "quick-scan-frames");
   const frames = await extractFrames(videoFilePath, framesDir, {
@@ -69,6 +76,9 @@ export async function runQuickScan(
           "Return an empty list if nothing here looks promising.",
         frames: frameInputs,
         operation: "quick_scan",
+        runToken: ctx.runToken,
+        sourceVideoId: ctx.sourceVideoId,
+        analysisJobId: ctx.analysisJobId,
         maxTokens: 4000,
       });
       costUsd += result.costUsd;
