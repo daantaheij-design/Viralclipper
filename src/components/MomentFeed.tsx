@@ -8,6 +8,7 @@ import { VerticalPlayer } from "./VerticalPlayer";
 import { RunDiscoveryButton } from "./RunDiscoveryButton";
 import type { MomentWithRelations } from "./types";
 import type { MomentAction, MomentView, SortBy } from "@/database/moments";
+import type { RerenderOutcome } from "@/lib/playerState";
 
 const CATEGORY_OPTIONS = Object.entries(CATEGORY_LABELS) as [string, string][];
 const SOURCE_OPTIONS = Object.entries(SOURCE_LABELS) as [string, string][];
@@ -88,6 +89,24 @@ export function MomentFeed({
 
   async function handleReanalyze(id: string) {
     await fetch(`/api/moments/${id}/reanalyze`, { method: "POST" });
+  }
+
+  async function handleRerender(id: string): Promise<RerenderOutcome> {
+    const res = await fetch(`/api/moments/${id}/rerender`, { method: "POST" });
+    const data = await res.json();
+
+    // Refresh this one moment from the server (rather than the whole list)
+    // so the card/player reflect the real post-repair state — including a
+    // fresh storage key and, via getMomentById's own self-check, an
+    // accurate status — without reshuffling the list's current filter/sort.
+    const refreshed = await fetch(`/api/moments/${id}`, { cache: "no-store" })
+      .then((r) => r.json())
+      .catch(() => null);
+    if (refreshed?.moment) {
+      setMoments((prev) => prev?.map((m) => (m.id === id ? refreshed.moment : m)) ?? null);
+    }
+
+    return res.ok ? data.result : { outcome: "failed", message: data.error ?? "Re-render request failed" };
   }
 
   return (
@@ -201,13 +220,18 @@ export function MomentFeed({
               onPreview={setPreviewMoment}
               onAction={handleAction}
               onReanalyze={handleReanalyze}
+              onRerender={handleRerender}
             />
           ))}
         </div>
       )}
 
       {previewMoment && (
-        <VerticalPlayer moment={previewMoment} onClose={() => setPreviewMoment(null)} />
+        <VerticalPlayer
+          moment={previewMoment}
+          onClose={() => setPreviewMoment(null)}
+          onRerender={handleRerender}
+        />
       )}
     </div>
   );

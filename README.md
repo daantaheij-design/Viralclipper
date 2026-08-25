@@ -117,6 +117,45 @@ yt-dlp/ffmpeg/Node versions and whether a `node` binary is resolvable (the same 
 `--js-runtimes node` needs to find) once at boot — check a service's logs after deploying to
 confirm the video pipeline is actually usable in that container. No secrets are ever included.
 
+### Missing media & the "Re-render 9:16" repair flow
+
+A `TikTokVersion` row saying `ready` is not, by itself, proof that the rendered file still exists
+— most notably, any clip rendered before the S3-compatible storage bucket was configured only ever
+lived on a container's ephemeral disk and was lost on the next redeploy. Rather than trust the
+stored status, the app verifies and repairs:
+
+- **`StorageBackend.exists(key)`** (`src/storage/types.ts`, implemented by both `local.ts` and
+  `s3.ts`) is a cheap existence check independent of `resolve()` (which returns a *playable* URL).
+  `GET /api/media/[momentId]` already resolved lazily and 404s if the object is gone — that part
+  needed no changes.
+- **`src/database/renderVerification.ts::healStaleReadyStatuses`** runs on every moment list/detail
+  fetch (`listMoments`/`getMomentById` in `src/database/moments.ts`): for each `ready` clip it
+  checks `storage.exists()` and, if the object is actually missing, flips that `TikTokVersion` to
+  the `media_missing` status (a dedicated `TikTokVersionStatus` value) and persists it — read-repair,
+  not a background job. `DetectedMoment.status` itself is left untouched (still `ready`/visible on
+  the dashboard) — only the render is affected. Fails open on a transient storage error so a real
+  outage doesn't make working clips look broken.
+- **`src/jobs/renderCore.ts::performRenderAndUpload`** is the single render+upload+verify path used
+  by both the automatic pipeline (`jobs/processing.ts`) and manual repair (`jobs/rerender.ts`) — a
+  clip is only marked `ready` after render, upload, *and* a post-upload `storage.exists()` check all
+  succeed. If the upload call reports success but the object can't be verified afterward, the
+  result is `media_missing`, never `ready` — this is exactly how the original bug happened (a
+  successful-looking upload that only wrote to disk that later disappeared), so it's never trusted
+  on its own again.
+- **`src/jobs/rerender.ts::repairRender`** is the manual "Re-render 9:16" entry point
+  (`POST /api/moments/[id]/rerender`, awaited, no polling needed for a single clip) — it re-uses
+  every already-persisted analysis field (timestamps, category, viral score, tracked subject
+  keyframes) and re-runs only the technical steps (re-acquire source video if needed, ffmpeg
+  render, bucket upload, existence verification). **It never calls Claude or re-runs
+  discovery/quick-scan/detailed-analysis** — no extra Anthropic cost for a repair. Logs a
+  `[repair] ...` narrative at each stage for production debugging.
+- The dashboard (`ClipCard.tsx`) shows a `RENDER MISSING`/`RENDER FAILED` badge and a "Re-render
+  9:16" button instead of ever claiming a clip is ready when it isn't; the preview player
+  (`VerticalPlayer.tsx`) has explicit states (loading/ready/media missing/render failed/source
+  unavailable — see `src/lib/playerState.ts`) instead of hanging on "Loading" forever, and falls
+  back to the missing-media state itself if a `ready`-looking video actually fails to play
+  (`<video onError>`), not just when the stored status already says so.
+
 ### Why a separate `worker` process
 
 Discovery and analysis do real work over minutes, not milliseconds (video download, AI vision
