@@ -192,16 +192,23 @@ video download/analysis/rendering are minutes-long, stateful, disk-using operati
 ## Deploying to Railway
 
 The repo ships one `Dockerfile` (Node 22 + ffmpeg + yt-dlp) shared by both services, and a root
-`railway.json` that only declares the **build** (`builder: DOCKERFILE`) — deliberately nothing
-about start commands or health checks. Railway applies `railway.json` as a default to every
-service deployed from this repo, and per-service fields committed there (like `deploy.*`) end up
-applying to *all* of them, including a worker with no HTTP server to health-check. Per-service
-**Start Command** and **Healthcheck Path**, set directly in each service's Settings in the Railway
-dashboard, always take priority over `railway.json` — that's the reliable way to make one service
-a web server and another a worker from the same repo, rather than committing a second
-"config-as-code" file and pointing a service at it by path (that per-service file-path override
-does not reliably isolate every field, which is exactly the healthcheck bleed-through this section
-fixes — don't reintroduce it).
+`railway.json` that declares the **build** (`builder: DOCKERFILE`) plus one `deploy` field:
+`preDeployCommand: ["npx prisma migrate deploy"]`. Railway applies `railway.json` as a default to
+every service deployed from this repo, and per-service fields committed there (like most of
+`deploy.*`) end up applying to *all* of them, including a worker with no HTTP server to
+health-check — which is why **Start Command** and **Healthcheck Path** are deliberately *not* in
+`railway.json` and instead live in each service's own Settings in the Railway dashboard, which
+always take priority over `railway.json`. `preDeployCommand` is the one exception, committed
+on purpose: unlike a healthcheck path, "run pending migrations before starting" is correct for
+*every* service, so it runs once per deploy — before the start command, using that same build —
+for both web and worker automatically, without relying on either service's Start Command string
+to remember to do it. This closes a real failure mode: a Start Command that's missing
+`npx prisma migrate deploy &&` (whether never set that way, or edited/reset later) previously meant
+a service could boot against a database schema older than what Prisma's client expects — exactly
+what happened in production when `source_videos.accessFailureCount` was queried before its
+migration had ever been applied. Do not remove `preDeployCommand`, and do not add
+`startCommand`/`healthcheckPath` back to `railway.json` — that's the healthcheck bleed-through this
+section fixes, and per-service Settings remain the right place for those two.
 
 ### 1. Create the project
 
@@ -222,6 +229,11 @@ If the worker service shows a Healthcheck Path left over from before (e.g. `/api
 from `railway.json`), clear it explicitly in its Settings — an empty Healthcheck Path means
 Railway just tracks whether the process is running, which is the correct behavior for a background
 worker.
+
+The `npx prisma migrate deploy &&` prefix in both Start Commands above is now redundant with
+`railway.json`'s `preDeployCommand` (migrations already ran once, successfully, before either
+service's start command executes) — harmless to keep since `prisma migrate deploy` is idempotent,
+but the point is migrations no longer *depend* on that prefix being present.
 
 ### 2. Storage bucket (S3-compatible)
 

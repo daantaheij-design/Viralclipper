@@ -132,17 +132,30 @@ APIs from tests.
 platform — see README.md's "Deploying to Railway" section for the full walkthrough. Two things
 worth knowing before touching either file:
 
-- **`railway.json` intentionally has no `deploy` section.** It used to (start command, health
-  check path), but Railway applies the root `railway.json` as a default to every service deployed
-  from this repo — so a `deploy.healthcheckPath` there was reaching the worker service too, which
-  has no HTTP server and would fail that check. Start Command and Healthcheck Path now live in
-  each Railway service's own dashboard Settings (which always override `railway.json`), not in a
-  committed file. Do not put `deploy.*` back in `railway.json`, and do not resurrect a second
-  `railway.<service>.json` file pointed at via a per-service "config file path" — that per-service
-  override does not reliably isolate every field either, which is exactly what caused this.
+- **`railway.json`'s `deploy` section is intentionally limited to `preDeployCommand`.** It used to
+  also carry start command / health check path, but Railway applies the root `railway.json` as a
+  default to every service deployed from this repo — so a `deploy.healthcheckPath` there was
+  reaching the worker service too, which has no HTTP server and would fail that check. Start
+  Command and Healthcheck Path stay in each Railway service's own dashboard Settings (which always
+  override `railway.json`) — do not put those two fields back in the committed file, and do not
+  resurrect a second `railway.<service>.json` file pointed at via a per-service "config file path"
+  (that override does not reliably isolate every field either, which is exactly what caused the
+  original bleed-through).
+- `deploy.preDeployCommand: ["npx prisma migrate deploy"]` is the one `deploy.*` field that
+  deliberately *is* committed and shared by every service — unlike the healthcheck, running
+  migrations before start is correct for **both** web and worker, so the same root-config
+  bleed-through that broke the healthcheck is exactly what we want here. This exists because
+  relying solely on each service's dashboard Start Command (e.g.
+  `npx prisma migrate deploy && npm run start`) to apply migrations means a manually-edited or
+  reset Start Command can silently skip them — which is what caused a real production outage
+  (`source_videos.accessFailureCount` didn't exist because a pending migration was never applied).
+  `preDeployCommand` runs once per deploy, before the start command, using the same build — so
+  migrations are now guaranteed regardless of what a service's Start Command happens to be.
+  `prisma migrate deploy` is idempotent, so it staying in a service's Start Command too is harmless
+  redundancy, not a bug.
 - Rendered clips go through a **Storage Bucket** (`src/storage/s3.ts`) rather than local disk once
   web and worker are separate containers, since Railway Volumes can't be attached to more than one
-  service; both services' Start Commands run `prisma migrate deploy` before their actual process.
+  service.
 
 ## Storage backends
 
