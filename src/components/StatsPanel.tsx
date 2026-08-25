@@ -19,6 +19,7 @@ interface Stats {
     rejectedByMetadata: number;
     rejectedWrongCategory: number;
     rejectedDirtySource: number;
+    pendingLocalFiltering: number;
     cleanCandidates: number;
     sentToAnthropic: number;
     detailedAnalyses: number;
@@ -110,13 +111,18 @@ export function StatsPanel() {
           <FunnelRow label="Rejected by metadata (dedup)" value={stats.funnel.rejectedByMetadata} dim />
           <FunnelRow label="Rejected — wrong category" value={stats.funnel.rejectedWrongCategory} dim />
           <FunnelRow label="Rejected — dirty source" value={stats.funnel.rejectedDirtySource} dim />
-          <FunnelRow label="Clean candidates (passed local gates)" value={stats.funnel.cleanCandidates} />
+          <FunnelRow label="Pending local filtering" value={stats.funnel.pendingLocalFiltering} dim />
+          <FunnelRow label="Clean candidates / waiting for AI" value={stats.funnel.cleanCandidates} />
           <FunnelRow label="Sent to Anthropic (quick scans)" value={stats.funnel.sentToAnthropic} />
           <FunnelRow label="Detailed analyses" value={stats.funnel.detailedAnalyses} />
           <FunnelRow label="Good moments" value={stats.funnel.goodMoments} />
-          {stats.funnel.waitingForAi > 0 && (
-            <FunnelRow label="Waiting for AI (clean, budget/kill-switch blocked)" value={stats.funnel.waitingForAi} dim />
-          )}
+          <p className="mt-2 border-t border-border/50 pt-2 text-[11px] text-muted">
+            &ldquo;Pending local filtering&rdquo; is the free backlog (acquisition + cleanliness scan,
+            zero Anthropic cost) — each worker tick drains up to your Free local filter batch size
+            from it. &ldquo;Clean candidates / waiting for AI&rdquo; is parked and ready; it only
+            moves to &ldquo;Sent to Anthropic&rdquo; once Paid AI Analysis is on, one batch of
+            Max quick scans per run at a time.
+          </p>
         </div>
 
         <div className="rounded-xl border border-border bg-surface p-4">

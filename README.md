@@ -104,6 +104,17 @@ of Claude calls.
   `suggestCleanSourceQueries()` — pure string suggestions for a cleaner version of the same
   incident (no discovery API calls made automatically; that's a deliberate scope boundary for this
   PR, not an oversight — see the funnel dashboard to review dirty leads yourself).
+- **Free local filtering throughput is completely decoupled from paid Anthropic throughput.**
+  `src/jobs/analysis.ts::runAnalysis` runs two independent batches per tick: a FREE batch (up to
+  `freeLocalFilterBatchSize`, default 25 — acquisition + the cleanliness scan above, zero Anthropic
+  cost) that drains the discovery backlog into `dirty_lead` or `waiting_for_ai`, then — only if
+  Paid AI Analysis is on — a PAID batch (up to `maxQuickScansPerRun`, default 1) that picks up
+  `waiting_for_ai` candidates for an actual Claude quick scan. `maxQuickScansPerRun` governs *only*
+  the second batch; it must never be used to cap the first (a production bug this fixed — the free
+  batch was wrongly reusing that same setting, so local filtering ran at 1 video per 5-minute tick
+  instead of the size the backlog actually needed). `waiting_for_ai` is deliberately the resting
+  state for *any* candidate that's passed every free gate, whether or not AI is currently
+  available — it's not just what a budget block produces.
 - **The hard AI budget gate is atomic, not a soft pre-check.** `src/ai/budget.ts::reserveAiBudget`
   is called from exactly one place — `analyzeFrames` (`src/ai/providers/claude.ts`), the *only*
   place this app ever calls the Anthropic API — immediately before every request, and is the only
@@ -139,11 +150,12 @@ of Claude calls.
   rendering, the genuinely multi-minute stages, still run in the background afterward). A lock held
   past 30 minutes (a crashed holder) is treated as abandoned and can be reclaimed.
 - **The Settings/cost dashboard is the source of truth**, not just a display: it shows the full
-  discovery funnel (discovered → rejected by metadata/category/dirty-source → clean candidates →
-  sent to Anthropic → detailed analyses → good moments), confirmed vs. reserved/in-flight spend,
-  remaining budget, and a prominent `AI BUDGET REACHED — PAID ANALYSIS PAUSED` banner at 100%. Local
-  ffmpeg/CV processing cost is never mixed into the Anthropic spend numbers (local gates never
-  write an `ApiUsage` row).
+  discovery funnel (discovered → rejected by metadata/category/dirty-source → pending local
+  filtering → clean candidates/waiting for AI → sent to Anthropic → detailed analyses → good
+  moments), confirmed vs. reserved/in-flight spend, remaining budget, and a prominent
+  `AI BUDGET REACHED — PAID ANALYSIS PAUSED` banner at 100%. Every funnel number is a real database
+  status count (`GET /api/stats`), never a client-side estimate. Local ffmpeg/CV processing cost is
+  never mixed into the Anthropic spend numbers (local gates never write an `ApiUsage` row).
 
 ### Media acquisition: being discovered ≠ being downloadable
 

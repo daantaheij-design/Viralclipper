@@ -23,10 +23,10 @@ export async function GET() {
     clipsReady,
     totalCostAgg,
     lastDiscoveryRun,
+    pendingLocalFilteringCount,
     filteredOutCount,
     dirtyLeadCount,
     waitingForAiCount,
-    cleanCandidateCount,
     quickScanUsage,
     detailedAnalysisUsage,
     quickScanCostAgg,
@@ -40,10 +40,16 @@ export async function GET() {
     prisma.tikTokVersion.count({ where: { status: "ready" } }),
     prisma.apiUsage.aggregate({ where: { provider: "anthropic" }, _sum: { costUsd: true } }),
     prisma.discoveryRun.findFirst({ orderBy: { startedAt: "desc" } }),
+    // Not yet through the free local stage (acquisition + cleanliness scan)
+    // — this is what src/jobs/analysis.ts's free batch drains, independent
+    // of maxQuickScansPerRun. See "Pending local filtering" on the funnel.
+    prisma.sourceVideo.count({ where: { status: { in: ["discovered", "queued_for_scan", "source_access_blocked"] } } }),
     prisma.sourceVideo.count({ where: { status: "filtered_out" } }),
     prisma.sourceVideo.count({ where: { status: "dirty_lead" } }),
+    // Passed every free/local gate and is parked, ready for a paid quick
+    // scan whenever Paid AI Analysis is on — the canonical "clean
+    // candidate" bucket (see src/jobs/analysis.ts's free stage).
     prisma.sourceVideo.count({ where: { status: "waiting_for_ai" } }),
-    prisma.sourceVideo.count({ where: { sourceCleanlinessScore: { gte: settings.minSourceCleanlinessScore } } }),
     prisma.apiUsage.count({ where: { provider: "anthropic", operation: "quick_scan" } }),
     prisma.apiUsage.count({ where: { provider: "anthropic", operation: "detailed_analysis" } }),
     prisma.apiUsage.aggregate({
@@ -77,17 +83,19 @@ export async function GET() {
     lastDiscoveryRun,
 
     // Funnel — where videos are being rejected, and at what stage, before
-    // any Anthropic cost is incurred. See README's "Cost control" section.
+    // any Anthropic cost is incurred. All real database status counts, not
+    // client-side estimates. See README's "Cost control" section.
     funnel: {
       videosDiscovered,
       rejectedByMetadata: lastDiscoveryRun?.duplicatesSkipped ?? 0,
       rejectedWrongCategory: filteredOutCount,
       rejectedDirtySource: dirtyLeadCount,
-      cleanCandidates: cleanCandidateCount,
+      pendingLocalFiltering: pendingLocalFilteringCount,
+      cleanCandidates: waitingForAiCount,
+      waitingForAi: waitingForAiCount,
       sentToAnthropic: quickScanUsage,
       detailedAnalyses: detailedAnalysisUsage,
       goodMoments,
-      waitingForAi: waitingForAiCount,
     },
 
     // Cost dashboard — confirmed vs. reserved/in-flight, and the hard

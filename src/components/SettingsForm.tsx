@@ -160,6 +160,14 @@ export function SettingsForm() {
         </div>
       </section>
 
+      <section>
+        <p className="mb-3 text-xs text-muted">
+          &ldquo;Free local filter batch size&rdquo; controls the zero-Anthropic-cost stage
+          (acquisition + source-cleanliness scan) — safe to set large, it never spends money.
+          &ldquo;Max quick scans per run&rdquo; and &ldquo;Max detailed analyses per run&rdquo;
+          are the actual paid Anthropic caps, and only ever apply when Paid AI Analysis is on.
+        </p>
+      </section>
       <section className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <NumberField
           label="Minimum viral score"
@@ -175,7 +183,13 @@ export function SettingsForm() {
           min={1}
         />
         <NumberField
-          label="Max quick scans per run"
+          label="Free local filter batch size"
+          value={settings.freeLocalFilterBatchSize}
+          onChange={(v) => save({ ...settings, freeLocalFilterBatchSize: v })}
+          min={1}
+        />
+        <NumberField
+          label="Max quick scans per run (paid)"
           value={settings.maxQuickScansPerRun}
           onChange={(v) => save({ ...settings, maxQuickScansPerRun: v })}
           min={0}
