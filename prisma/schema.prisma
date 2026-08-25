@@ -41,6 +41,10 @@ enum Category {
 // Lifecycle of a discovered source video moving through the pipeline.
 enum VideoProcessingStatus {
   discovered
+  // Rejected by the cheap, local, metadata-only category prefilter (title/
+  // description obviously wrong topic, or below minPreCategoryRelevanceScore)
+  // — before acquisition, before any Anthropic call. See
+  // src/discovery/categoryPrefilter.ts.
   filtered_out
   queued_for_scan
   scanning
@@ -52,6 +56,21 @@ enum VideoProcessingStatus {
   // of hammering the source again on the next tick; see
   // src/database/acquisitionCooldown.ts.
   source_access_blocked
+  // The video was acquired and locally scanned (src/analysis/sourceCleanliness.ts)
+  // but scored below minSourceCleanlinessScore (captions/arrows/circles/
+  // split-screen/heavy overlays) — never sent to Anthropic. Kept as a
+  // "lead": sourceCleanlinessScore/reason and suggested clean-source search
+  // queries are persisted so a promising-but-dirty incident isn't just
+  // forgotten. See README's "Cost control" section.
+  dirty_lead
+  // Passed every free/local gate (category, cleanliness) but couldn't reach
+  // Anthropic this attempt — Paid AI Analysis is OFF, ANTHROPIC_API_KEY is
+  // unset, or the daily/per-run budget is exhausted. Deliberately distinct
+  // from `error`: this is not a failure, and must not retry-loop every
+  // worker tick — it simply waits until AI becomes available again, then
+  // resumes from here (re-acquisition + the free cleanliness scan are cheap
+  // to redo; no Anthropic cost was ever incurred).
+  waiting_for_ai
   error
 }
 
@@ -59,6 +78,16 @@ enum DiscoveryRunStatus {
   running
   completed
   failed
+}
+
+// Lifecycle of one atomic AI-spend reservation — see src/ai/budget.ts.
+// "reserved" is the only state that counts toward in-flight spend/
+// concurrency; a reservation always leaves that state quickly (the
+// Anthropic call it guards is a single request, not a long job).
+enum AiReservationStatus {
+  reserved
+  committed
+  released
 }
 
 enum AnalysisJobType {
@@ -99,17 +128,17 @@ enum TikTokVersionStatus {
 // ---------------------------------------------------------------------------
 
 model Source {
-  id        String   @id @default(cuid())
+  id        String     @id @default(cuid())
   name      SourceName @unique
-  enabled   Boolean  @default(true)
+  enabled   Boolean    @default(true)
   // Free-form per-source config (rate limits, search defaults, etc.)
-  config    Json     @default("{}")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  config    Json       @default("{}")
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
 
-  accounts       SourceAccount[]
-  searchQueries  SearchQuery[]
-  sourceVideos   SourceVideo[]
+  accounts      SourceAccount[]
+  searchQueries SearchQuery[]
+  sourceVideos  SourceVideo[]
 
   @@map("sources")
 }
@@ -135,16 +164,16 @@ model SourceAccount {
 // ---------------------------------------------------------------------------
 
 model SearchQuery {
-  id           String    @id @default(cuid())
-  sourceId     String
-  source       Source    @relation(fields: [sourceId], references: [id], onDelete: Cascade)
-  category     Category
-  text         String
-  active       Boolean   @default(true)
-  timesUsed    Int       @default(0)
-  lastUsedAt   DateTime?
-  generatedBy  String    @default("seed") // "seed" | "rotation" | "long_tail"
-  createdAt    DateTime  @default(now())
+  id          String    @id @default(cuid())
+  sourceId    String
+  source      Source    @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  category    Category
+  text        String
+  active      Boolean   @default(true)
+  timesUsed   Int       @default(0)
+  lastUsedAt  DateTime?
+  generatedBy String    @default("seed") // "seed" | "rotation" | "long_tail"
+  createdAt   DateTime  @default(now())
 
   sourceVideos SourceVideo[]
 
@@ -154,16 +183,16 @@ model SearchQuery {
 }
 
 model DiscoveryRun {
-  id                String              @id @default(cuid())
-  status            DiscoveryRunStatus  @default(running)
-  startedAt         DateTime            @default(now())
+  id                String             @id @default(cuid())
+  status            DiscoveryRunStatus @default(running)
+  startedAt         DateTime           @default(now())
   finishedAt        DateTime?
-  queriesUsed       Int                 @default(0)
-  candidatesFound   Int                 @default(0)
-  uniqueCandidates  Int                 @default(0)
-  duplicatesSkipped Int                 @default(0)
+  queriesUsed       Int                @default(0)
+  candidatesFound   Int                @default(0)
+  uniqueCandidates  Int                @default(0)
+  duplicatesSkipped Int                @default(0)
   errorMessage      String?
-  stats             Json                @default("{}")
+  stats             Json               @default("{}")
 
   sourceVideos SourceVideo[]
 
@@ -172,46 +201,68 @@ model DiscoveryRun {
 
 // One row per (source, source video id) ever discovered — never re-inserted.
 model SourceVideo {
-  id                String                 @id @default(cuid())
-  sourceId          String
-  source            Source                 @relation(fields: [sourceId], references: [id])
-  sourceVideoId     String
-  url               String
-  title             String
-  description       String                 @default("")
-  thumbnailUrl      String?
-  channelName       String?
-  channelId         String?
-  durationSeconds   Float?
-  uploadDate        DateTime?
-  viewCount         Int?
-  likeCount         Int?
-  commentCount      Int?
-  category          Category
-  discoveryQueryId  String?
-  discoveryQuery    SearchQuery?           @relation(fields: [discoveryQueryId], references: [id])
-  discoveryRunId    String?
-  discoveryRun      DiscoveryRun?          @relation(fields: [discoveryRunId], references: [id])
-  discoveredAt      DateTime               @default(now())
+  id               String        @id @default(cuid())
+  sourceId         String
+  source           Source        @relation(fields: [sourceId], references: [id])
+  sourceVideoId    String
+  url              String
+  title            String
+  description      String        @default("")
+  thumbnailUrl     String?
+  channelName      String?
+  channelId        String?
+  durationSeconds  Float?
+  uploadDate       DateTime?
+  viewCount        Int?
+  likeCount        Int?
+  commentCount     Int?
+  category         Category
+  discoveryQueryId String?
+  discoveryQuery   SearchQuery?  @relation(fields: [discoveryQueryId], references: [id])
+  discoveryRunId   String?
+  discoveryRun     DiscoveryRun? @relation(fields: [discoveryRunId], references: [id])
+  discoveredAt     DateTime      @default(now())
 
-  preliminaryScore  Float                  @default(0)
-  viewVelocity      Float?                 // views per hour since upload, when computable
+  preliminaryScore Float  @default(0)
+  viewVelocity     Float? // views per hour since upload, when computable
 
-  status            VideoProcessingStatus  @default(discovered)
-  errorMessage      String?
+  status       VideoProcessingStatus @default(discovered)
+  errorMessage String?
 
   // Backoff state for `source_access_blocked` — see
   // src/database/acquisitionCooldown.ts. accessFailureCount drives
   // exponential backoff; nextRetryAt is when this video becomes eligible
   // for another acquisition attempt again. Both no-ops for any other status.
-  accessFailureCount Int                   @default(0)
-  nextRetryAt       DateTime?
+  accessFailureCount Int       @default(0)
+  nextRetryAt        DateTime?
 
-  titleFingerprint  String?                // normalized-title hash, for cheap dedup
+  titleFingerprint String? // normalized-title hash, for cheap dedup
 
-  analysisJobs      AnalysisJob[]
-  candidateWindows  CandidateWindow[]
-  detectedMoments   DetectedMoment[]
+  // Cheap, local, metadata-only pre-filter score (0-100) — see
+  // src/discovery/categoryPrefilter.ts. Computed at discovery time, before
+  // acquisition, before any Anthropic call.
+  preCategoryRelevanceScore Int?
+  categoryPrefilterReason   String?
+
+  // Local, zero-Anthropic source-cleanliness scan (src/analysis/sourceCleanliness.ts)
+  // — populated once the video has been acquired and sampled, regardless of
+  // whether it passes or fails the gate.
+  sourceCleanlinessScore  Int?
+  hasLargeCaptions        Boolean?
+  hasArrows               Boolean?
+  hasCircles              Boolean?
+  hasSplitScreen          Boolean?
+  hasLargeGraphicOverlays Boolean?
+  likelyRepost            Boolean?
+  cleanlinessReason       String?
+  // Suggested searches for a cleaner version of the same incident (pure
+  // string generation from title/metadata — no discovery API calls made
+  // automatically; see README's "Dirty leads" section) — string[].
+  cleanSourceQueries      Json?
+
+  analysisJobs          AnalysisJob[]
+  candidateWindows      CandidateWindow[]
+  detectedMoments       DetectedMoment[]
   duplicateFingerprints DuplicateFingerprint[]
 
   @@unique([sourceId, sourceVideoId])
@@ -223,12 +274,12 @@ model SourceVideo {
 }
 
 model DuplicateFingerprint {
-  id            String       @id @default(cuid())
+  id            String      @id @default(cuid())
   sourceVideoId String
-  sourceVideo   SourceVideo  @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
-  kind          String       // "title_hash" | "url" | "perceptual_hash" | "audio_hash"
+  sourceVideo   SourceVideo @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  kind          String // "title_hash" | "url" | "perceptual_hash" | "audio_hash"
   value         String
-  createdAt     DateTime     @default(now())
+  createdAt     DateTime    @default(now())
 
   @@index([kind, value])
   @@map("duplicate_fingerprints")
@@ -236,16 +287,16 @@ model DuplicateFingerprint {
 
 // A quick-scan or detailed-analysis job run against one source video.
 model AnalysisJob {
-  id             String            @id @default(cuid())
-  sourceVideoId  String
-  sourceVideo    SourceVideo       @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
-  type           AnalysisJobType
-  status         AnalysisJobStatus @default(pending)
-  startedAt      DateTime?
-  finishedAt     DateTime?
-  errorMessage   String?
-  costUsd        Float             @default(0)
-  createdAt      DateTime          @default(now())
+  id            String            @id @default(cuid())
+  sourceVideoId String
+  sourceVideo   SourceVideo       @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  type          AnalysisJobType
+  status        AnalysisJobStatus @default(pending)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  errorMessage  String?
+  costUsd       Float             @default(0)
+  createdAt     DateTime          @default(now())
 
   @@index([sourceVideoId, type])
   @@map("analysis_jobs")
@@ -253,14 +304,14 @@ model AnalysisJob {
 
 // Broad-scan (pass 1) candidate window on a source video, generously padded.
 model CandidateWindow {
-  id             String       @id @default(cuid())
-  sourceVideoId  String
-  sourceVideo    SourceVideo  @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
-  startSeconds   Float
-  endSeconds     Float
-  reason         String       @default("")
-  analyzed       Boolean      @default(false)
-  createdAt      DateTime     @default(now())
+  id            String      @id @default(cuid())
+  sourceVideoId String
+  sourceVideo   SourceVideo @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  startSeconds  Float
+  endSeconds    Float
+  reason        String      @default("")
+  analyzed      Boolean     @default(false)
+  createdAt     DateTime    @default(now())
 
   detectedMoments DetectedMoment[]
 
@@ -269,41 +320,41 @@ model CandidateWindow {
 
 // A specific viral moment found inside a candidate window (pass 2 output).
 model DetectedMoment {
-  id                 String            @id @default(cuid())
-  sourceVideoId      String
-  sourceVideo        SourceVideo       @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
-  candidateWindowId  String?
-  candidateWindow    CandidateWindow?  @relation(fields: [candidateWindowId], references: [id])
+  id                String           @id @default(cuid())
+  sourceVideoId     String
+  sourceVideo       SourceVideo      @relation(fields: [sourceVideoId], references: [id], onDelete: Cascade)
+  candidateWindowId String?
+  candidateWindow   CandidateWindow? @relation(fields: [candidateWindowId], references: [id])
 
-  category           Category
-  title              String
-  description        String            // observable-only explanation
-  reason             String            // why this scored the way it did
+  category    Category
+  title       String
+  description String // observable-only explanation
+  reason      String // why this scored the way it did
 
-  startSeconds       Float
-  peakSeconds         Float
-  endSeconds         Float
+  startSeconds Float
+  peakSeconds  Float
+  endSeconds   Float
 
-  scores             Json              // { hook, visual_action, conflict, escalation, surprise, emotion, payoff, understandability, retention, rewatch, tiktok_suitability }
-  viralScore         Int
-  confidence         Float
+  scores     Json // { hook, visual_action, conflict, escalation, surprise, emotion, payoff, understandability, retention, rewatch, tiktok_suitability }
+  viralScore Int
+  confidence Float
 
   // Subject bounding boxes at a handful of instants across the moment, as
   // returned by pass-2 analysis — TrackedKeyframe[] (see src/video/types.ts).
   // Persisted so a render retry never needs another AI call to re-derive
   // the smart-crop pan path.
-  trackedKeyframes   Json              @default("[]")
+  trackedKeyframes Json @default("[]")
 
-  status             ClipStatus        @default(moment_found)
-  userNote           String?
-  savedAt            DateTime?
-  usedAt             DateTime?
-  rejectedAt         DateTime?
+  status     ClipStatus @default(moment_found)
+  userNote   String?
+  savedAt    DateTime?
+  usedAt     DateTime?
+  rejectedAt DateTime?
 
-  createdAt          DateTime          @default(now())
-  updatedAt          DateTime          @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  tikTokVersion      TikTokVersion?
+  tikTokVersion TikTokVersion?
 
   @@index([status, viralScore])
   @@index([category, viralScore])
@@ -313,21 +364,21 @@ model DetectedMoment {
 
 // The rendered clean 9:16 vertical export of a detected moment.
 model TikTokVersion {
-  id               String               @id @default(cuid())
-  momentId         String               @unique
-  moment           DetectedMoment       @relation(fields: [momentId], references: [id], onDelete: Cascade)
-  status           TikTokVersionStatus  @default(queued)
-  storageKey       String?              // path/key in local or object storage
-  width            Int                  @default(1080)
-  height           Int                  @default(1920)
-  durationSeconds  Float?
-  fps              Float?
-  fileSizeBytes    Int?
-  cropKeyframes    Json                 @default("[]") // [{ timeSeconds, x, y, w, h }]
-  errorMessage     String?
-  renderedAt       DateTime?
-  createdAt        DateTime             @default(now())
-  updatedAt        DateTime             @updatedAt
+  id              String              @id @default(cuid())
+  momentId        String              @unique
+  moment          DetectedMoment      @relation(fields: [momentId], references: [id], onDelete: Cascade)
+  status          TikTokVersionStatus @default(queued)
+  storageKey      String? // path/key in local or object storage
+  width           Int                 @default(1080)
+  height          Int                 @default(1920)
+  durationSeconds Float?
+  fps             Float?
+  fileSizeBytes   Int?
+  cropKeyframes   Json                @default("[]") // [{ timeSeconds, x, y, w, h }]
+  errorMessage    String?
+  renderedAt      DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
 
   @@map("tiktok_versions")
 }
@@ -337,19 +388,68 @@ model TikTokVersion {
 // ---------------------------------------------------------------------------
 
 model ApiUsage {
-  id              String   @id @default(cuid())
-  provider        String   // "anthropic" | "youtube" | "reddit"
-  operation       String   // "quick_scan" | "detailed_analysis" | "search" | ...
-  tokensIn        Int      @default(0)
-  tokensOut       Int      @default(0)
-  costUsd         Float    @default(0)
-  sourceVideoId   String?
-  momentId        String?
-  discoveryRunId  String?
-  createdAt       DateTime @default(now())
+  id               String   @id @default(cuid())
+  provider         String // "anthropic" | "youtube" | "reddit"
+  operation        String // "quick_scan" | "detailed_analysis" | "search" | ...
+  model            String? // e.g. "claude-opus-5" — the model actually used
+  tokensIn         Int      @default(0)
+  tokensOut        Int      @default(0)
+  estimatedCostUsd Float? // pessimistic pre-call estimate this actual cost is reconciled against
+  costUsd          Float    @default(0) // actual cost, computed from real token usage
+  sourceVideoId    String?
+  momentId         String?
+  discoveryRunId   String?
+  analysisJobId    String?
+  runToken         String? // groups calls made within one runAnalysis()/pipeline invocation — see src/ai/budget.ts
+  createdAt        DateTime @default(now())
 
   @@index([provider, createdAt])
+  @@index([runToken])
   @@map("api_usage")
+}
+
+// One atomic reservation against the AI spending budget — created and
+// checked inside a single Postgres-locked transaction (see src/ai/budget.ts)
+// so concurrent workers/requests can never race past the daily/per-run
+// limit. Deliberately separate from ApiUsage (the permanent, append-only
+// cost ledger): this table is an ephemeral lock, short-lived by
+// construction (a reservation exists only for the duration of one Anthropic
+// request) and safe to be sparse/pruned later.
+model AiSpendReservation {
+  id               String              @id @default(cuid())
+  status           AiReservationStatus @default(reserved)
+  kind             String // "quick_scan" | "detailed_analysis"
+  estimatedCostUsd Float
+  actualCostUsd    Float?
+  runToken         String
+  sourceVideoId    String?
+  momentId         String?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  // Reservations that are still "reserved" past this point are treated as
+  // abandoned (e.g. the process crashed mid-call) and excluded from
+  // in-flight spend/concurrency — see src/ai/budget.ts's release-expired step.
+  expiresAt        DateTime
+
+  @@index([status])
+  @@index([runToken])
+  @@map("ai_spend_reservations")
+}
+
+// A simple named mutex backed by an atomic UPDATE...WHERE...RETURNING
+// compare-and-swap (see src/database/jobLock.ts) — used to make sure a
+// discovery run or an analysis batch never runs twice concurrently across
+// the web service and the worker (or multiple worker replicas). A stale
+// lock (holder crashed) expires on its own after staleAfterMs and can be
+// re-acquired by the next caller.
+model JobLock {
+  name        String    @id
+  status      String    @default("idle") // "idle" | "running"
+  holderToken String?
+  startedAt   DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  @@map("job_locks")
 }
 
 // ---------------------------------------------------------------------------
@@ -370,10 +470,10 @@ model AppSetting {
 
 model ErrorLog {
   id        String   @id @default(cuid())
-  scope     String   // "discovery" | "quick_scan" | "detailed_analysis" | "render" | ...
+  scope     String // "discovery" | "quick_scan" | "detailed_analysis" | "render" | ...
   message   String
   stack     String?
-  context   Json      @default("{}")
+  context   Json     @default("{}")
   createdAt DateTime @default(now())
 
   @@index([scope, createdAt])

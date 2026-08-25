@@ -18,7 +18,31 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
 - **Every AI vision call goes through `src/ai/providers/claude.ts::analyzeFrames`.** It forces
   structured output via `output_config.format` + a Zod schema (not tool-use forcing, not prose
   parsing) and records cost to `ApiUsage` on every call. Never call the Anthropic SDK directly
-  from `analysis/`.
+  from `analysis/`. This is also the single enforcement point for the hard AI-spend gate — see the
+  next bullet — so this rule doubles as "never bypass the budget gate," not just a style
+  preference.
+- **The AI budget gate (`src/ai/budget.ts::reserveAiBudget`) is atomic and must never be
+  bypassed, softened, or duplicated.** It's called from exactly one place — inside `analyzeFrames`,
+  immediately before the Anthropic request — inside a Postgres transaction holding
+  `pg_advisory_xact_lock` so concurrent processes (web + worker, multiple worker replicas) can't
+  race past the daily/per-run/concurrency limits. A blocked call throws `AiBudgetBlockedError`;
+  catch it explicitly (`instanceof`) wherever you call `runQuickScan`/`runDetailedAnalysis` —
+  never let it fall into a generic catch that treats it like an ordinary failure (that's exactly
+  what turns a budget block into a `waiting_for_ai` `SourceVideo` status instead of an `error`
+  that never retries once conditions change). Do not add a second place that checks
+  `settings.paidAiAnalysisEnabled`/budget and decides to call Anthropic anyway — every caller must
+  go through `analyzeFrames`, full stop. This exists because of a real production incident (a $5
+  Anthropic top-up burned through in a day, no atomic cap enforcing the daily budget) — see
+  README's "Cost control" section before touching any of `src/ai/budget.ts`,
+  `src/ai/providers/claude.ts`, or the `AiSpendReservation` model.
+- **The local, zero-Anthropic gates run before acquisition/analysis ever gets a chance to spend
+  anything.** `src/discovery/categoryPrefilter.ts` (discovery time, metadata only) and
+  `src/analysis/sourceCleanliness.ts` (after acquisition, real sampled frames, still zero
+  Anthropic cost) must both run — and must both keep passing their own "never imports `@/ai/`"
+  structural test — before `jobs/analysis.ts` ever calls `runQuickScan`. If you touch the pipeline
+  order in `jobs/analysis.ts` or `src/discovery/runDiscovery.ts`, keep `jobs/analysis.test.ts`'s
+  structural ordering assertion (`scanSourceCleanliness(...)` appears before `runQuickScan(...)`
+  in the source text) meaningful, not just passing by coincidence.
 - **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
   never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
   `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.
@@ -84,11 +108,24 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   both services' Railway start commands run `npx prisma migrate deploy`. Don't move them back
   without also changing how the worker runs in production.
 - **`DEFAULT_SETTINGS` in `src/database/settings.ts` and `seedSources()` in `src/database/seed.ts`
-  are deliberately conservative** (YouTube only, Road Rage only, small per-run caps) — that's the
-  safe first-deploy configuration, not a permanent product decision. They only take effect on a
-  fresh database with no `AppSetting`/`Source` rows yet; changing them doesn't affect an existing
-  deployment that's already saved its own settings. Raise the numbers from the Settings page, not
-  by editing these defaults, once a real deployment has been verified end to end.
+  are deliberately conservative** (YouTube only, Road Rage only, small per-run caps, automatic
+  discovery OFF, **Paid AI Analysis OFF**, a $0.50 daily / $0.20 per-run Anthropic budget) — that's
+  the safe first-deploy configuration, not a permanent product decision. For a *fresh* database
+  (no `AppSetting` row yet) these are just the code-level defaults; for an *existing* installation
+  that already has a `discovery_settings` row, the `ai_cost_control` migration additionally
+  force-overwrites the automatic-discovery toggle, Paid AI Analysis, and every numeric cap to
+  these same safe values via a one-time `UPDATE` — see that migration's SQL and its comment before
+  assuming "only affects fresh installs" is still true; it was a deliberate exception for this one
+  migration given what caused it (see README's "Cost control"). Raise the numbers from the
+  Settings page after a real deployment has been verified end to end and you've decided to spend —
+  never by editing these defaults, and never automatically as part of a future migration/deploy.
+- **Two DB-backed job locks (`src/database/jobLock.ts`) — `"discovery"` and `"analysis"`** — must
+  keep guarding `jobs/discovery.ts::runDiscoveryJob` and `jobs/analysis.ts::runAnalysis`
+  respectively. They're what makes triple-clicking "Run discovery now" (or a worker tick racing a
+  manual trigger) produce one real run instead of duplicates. If you add another entry point that
+  can trigger discovery or analysis, route it through those same functions rather than calling
+  `discovery/runDiscovery.ts::runDiscovery()` or the analysis internals directly — bypassing them
+  reintroduces the exact race this exists to prevent.
 
 ## Local development
 

@@ -17,3 +17,24 @@ export function estimateCostUsd(model: string, inputTokens: number, outputTokens
   const pricing = PRICING_PER_MTOK[model] ?? DEFAULT_PRICING;
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
 }
+
+// Deliberately pessimistic (rounds up) per-image token estimate used only to
+// reserve budget *before* a call is made, when real usage isn't known yet —
+// Claude's actual image tokenization varies with resolution, but this is a
+// safe ceiling for the frame sizes this app extracts (see video/ffmpeg.ts).
+// A reservation that slightly overestimates just blocks a hair earlier than
+// strictly necessary; one that underestimates would let spend slip past the
+// hard cap, which is the one failure mode that isn't acceptable here.
+const ESTIMATED_TOKENS_PER_IMAGE = 1600;
+const ESTIMATED_PROMPT_OVERHEAD_TOKENS = 800;
+
+/**
+ * Pessimistic upper-bound cost estimate for one `analyzeFrames` call, used
+ * to reserve budget before the request is sent (see src/ai/budget.ts). Uses
+ * `maxTokens` (the request's own output cap) as the output-token estimate,
+ * since actual output can never exceed what was requested.
+ */
+export function estimateMaxCostUsd(model: string, frameCount: number, maxTokens: number): number {
+  const estimatedInputTokens = frameCount * ESTIMATED_TOKENS_PER_IMAGE + ESTIMATED_PROMPT_OVERHEAD_TOKENS;
+  return estimateCostUsd(model, estimatedInputTokens, maxTokens);
+}

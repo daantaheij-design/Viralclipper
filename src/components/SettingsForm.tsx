@@ -42,6 +42,74 @@ export function SettingsForm() {
 
   return (
     <div className="space-y-8">
+      <section
+        className={`rounded-xl border-2 p-4 ${
+          settings.paidAiAnalysisEnabled ? "border-accent bg-surface" : "border-red-800 bg-red-950/30"
+        }`}
+      >
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="font-semibold text-foreground">Paid AI Analysis</h2>
+            <p className="text-sm text-muted">
+              Emergency kill switch. When OFF, <strong>no Anthropic API call can happen anywhere</strong> —
+              not the worker, not &ldquo;Run discovery now&rdquo;, not &ldquo;Analyze Again&rdquo;, not
+              retries, not source repair. Discovery and free/local filtering (cleanliness scan,
+              category prefilter) keep running either way.
+            </p>
+          </div>
+          <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+            <input
+              type="checkbox"
+              checked={settings.paidAiAnalysisEnabled}
+              onChange={(e) => save({ ...settings, paidAiAnalysisEnabled: e.target.checked })}
+              className="peer sr-only"
+            />
+            <div className="h-6 w-11 rounded-full bg-neutral-700 transition peer-checked:bg-accent" />
+            <div className="absolute left-1 h-4 w-4 rounded-full bg-white transition peer-checked:translate-x-5" />
+          </label>
+        </div>
+        <p className={`mt-3 text-sm font-semibold ${settings.paidAiAnalysisEnabled ? "text-accent" : "text-red-300"}`}>
+          Paid AI Analysis is {settings.paidAiAnalysisEnabled ? "ON" : "OFF"}
+        </p>
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <NumberField
+          label="Daily Anthropic budget (USD, 0 = no cap)"
+          value={settings.dailyAiBudgetUsd}
+          onChange={(v) => save({ ...settings, dailyAiBudgetUsd: v })}
+          min={0}
+          step={0.1}
+        />
+        <NumberField
+          label="Per-run Anthropic budget (USD, 0 = no cap)"
+          value={settings.perRunAiBudgetUsd}
+          onChange={(v) => save({ ...settings, perRunAiBudgetUsd: v })}
+          min={0}
+          step={0.05}
+        />
+        <NumberField
+          label="Max concurrent Anthropic calls"
+          value={settings.maxConcurrentAnthropicCalls}
+          onChange={(v) => save({ ...settings, maxConcurrentAnthropicCalls: v })}
+          min={1}
+        />
+        <NumberField
+          label="Min source cleanliness score (0-100)"
+          value={settings.minSourceCleanlinessScore}
+          onChange={(v) => save({ ...settings, minSourceCleanlinessScore: v })}
+          min={0}
+          max={100}
+        />
+        <NumberField
+          label="Min pre-category relevance score (0-100)"
+          value={settings.minPreCategoryRelevanceScore}
+          onChange={(v) => save({ ...settings, minPreCategoryRelevanceScore: v })}
+          min={0}
+          max={100}
+        />
+      </section>
+
       <section>
         <div className="flex items-center justify-between">
           <div>
@@ -123,13 +191,6 @@ export function SettingsForm() {
           value={settings.maxRendersPerRun}
           onChange={(v) => save({ ...settings, maxRendersPerRun: v })}
           min={0}
-        />
-        <NumberField
-          label="Daily AI budget (USD, 0 = no cap)"
-          value={settings.dailyAiBudgetUsd}
-          onChange={(v) => save({ ...settings, dailyAiBudgetUsd: v })}
-          min={0}
-          step={0.5}
         />
       </section>
 

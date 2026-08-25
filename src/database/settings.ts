@@ -10,23 +10,46 @@ export interface DiscoverySettings {
   maxQuickScansPerRun: number;
   maxDetailedAnalysesPerRun: number;
   maxRendersPerRun: number;
+
+  // --- Cost control -----------------------------------------------------
+  // Global emergency kill switch: when false, NO Anthropic call may happen
+  // from anywhere (worker, manual discovery, Analyze Again, retries,
+  // repair) — see src/ai/budget.ts::reserveAiBudget, which is the single
+  // enforcement point every Anthropic call goes through.
+  paidAiAnalysisEnabled: boolean;
   dailyAiBudgetUsd: number;
+  perRunAiBudgetUsd: number;
+  maxConcurrentAnthropicCalls: number;
+  // Local, zero-Anthropic gates a video must pass before it's ever eligible
+  // for a Claude call — see src/analysis/sourceCleanliness.ts and
+  // src/discovery/categoryPrefilter.ts.
+  minSourceCleanlinessScore: number;
+  minPreCategoryRelevanceScore: number;
 }
 
-// Deliberately conservative for the first live run against real
-// YouTube/Anthropic/ffmpeg infrastructure — one category, small caps at every
-// stage. Raise these from the Settings page once a full run has been
-// verified end to end.
+// SAFE PRODUCTION DEFAULTS. Automatic discovery and Paid AI Analysis both
+// start OFF; budgets start deliberately tiny. This is intentional — see the
+// "Critical cost-control" PR that added these: a $5 Anthropic credit top-up
+// was burned through in a single day because nothing actually capped
+// concurrent/total spend. Raise these from the Settings page only after you
+// have reviewed them; do not flip Paid AI Analysis ON as part of a
+// deployment/migration — that decision is the operator's alone.
 export const DEFAULT_SETTINGS: DiscoverySettings = {
-  automaticDiscoveryEnabled: true,
+  automaticDiscoveryEnabled: false,
   discoveryFrequencyHours: 4,
   enabledCategories: ["road_rage"],
   minViralScore: 70,
   candidatesPerRun: 20,
-  maxQuickScansPerRun: 5,
-  maxDetailedAnalysesPerRun: 2,
-  maxRendersPerRun: 2,
-  dailyAiBudgetUsd: 5,
+  maxQuickScansPerRun: 1,
+  maxDetailedAnalysesPerRun: 1,
+  maxRendersPerRun: 1,
+
+  paidAiAnalysisEnabled: false,
+  dailyAiBudgetUsd: 0.5,
+  perRunAiBudgetUsd: 0.2,
+  maxConcurrentAnthropicCalls: 1,
+  minSourceCleanlinessScore: 75,
+  minPreCategoryRelevanceScore: 70,
 };
 
 const SETTINGS_KEY = "discovery_settings";

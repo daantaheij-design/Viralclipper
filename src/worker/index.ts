@@ -30,8 +30,8 @@ async function tick(): Promise<void> {
 
     if (settings.automaticDiscoveryEnabled && (await shouldRunDiscoveryNow(settings.discoveryFrequencyHours))) {
       console.log("[worker] running discovery");
-      const summary = await runDiscoveryJob();
-      console.log("[worker] discovery done", summary);
+      const result = await runDiscoveryJob();
+      console.log("[worker] discovery", result.outcome, result.outcome === "completed" ? result.summary : "");
     }
 
     console.log("[worker] running analysis");
