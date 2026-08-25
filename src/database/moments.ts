@@ -1,4 +1,5 @@
 import { prisma } from "./client";
+import { healStaleReadyStatuses } from "./renderVerification";
 import type { Category, ClipStatus, Prisma, SourceName } from "@/generated/prisma";
 
 export type MomentView = "discover" | "top" | "saved" | "used" | "rejected";
@@ -82,6 +83,7 @@ export function momentListArgs(filters: MomentFilters) {
 export async function listMoments(filters: MomentFilters) {
   const args = momentListArgs(filters);
   let moments = await prisma.detectedMoment.findMany(args);
+  moments = await healStaleReadyStatuses(moments);
 
   if (filters.minDurationSeconds !== undefined) {
     moments = moments.filter(
@@ -97,10 +99,13 @@ export async function listMoments(filters: MomentFilters) {
 }
 
 export async function getMomentById(id: string) {
-  return prisma.detectedMoment.findUnique({
+  const moment = await prisma.detectedMoment.findUnique({
     where: { id },
     include: { sourceVideo: { include: { source: true } }, tikTokVersion: true },
   });
+  if (!moment) return null;
+  const [healed] = await healStaleReadyStatuses([moment]);
+  return healed;
 }
 
 export type MomentAction = "save" | "reject" | "use" | "editing" | "unsave";

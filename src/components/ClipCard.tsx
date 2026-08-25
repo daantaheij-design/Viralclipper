@@ -9,6 +9,8 @@ import {
   formatTimestamp,
   scoreColorClass,
 } from "@/lib/format";
+import { canRerender, deriveRenderDisplayState, RENDER_STATE_BADGE } from "@/lib/playerState";
+import type { RerenderOutcome } from "@/lib/playerState";
 import type { MomentAction, MomentView } from "@/database/moments";
 import type { MomentWithRelations } from "./types";
 
@@ -18,6 +20,7 @@ interface ClipCardProps {
   onPreview: (moment: MomentWithRelations) => void;
   onAction: (id: string, action: MomentAction) => Promise<void>;
   onReanalyze: (id: string) => Promise<void>;
+  onRerender: (id: string) => Promise<RerenderOutcome>;
 }
 
 function ActionButton({
@@ -47,11 +50,13 @@ function ActionButton({
   );
 }
 
-export function ClipCard({ moment, view, onPreview, onAction, onReanalyze }: ClipCardProps) {
+export function ClipCard({ moment, view, onPreview, onAction, onReanalyze, onRerender }: ClipCardProps) {
   const [busy, setBusy] = useState(false);
+  const [rerendering, setRerendering] = useState(false);
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const duration = moment.endSeconds - moment.startSeconds;
-  const tiktokStatus = moment.tikTokVersion?.status;
+  const renderState = deriveRenderDisplayState(moment.tikTokVersion?.status);
+  const badge = RENDER_STATE_BADGE[renderState];
 
   async function act(action: MomentAction) {
     setBusy(true);
@@ -59,6 +64,15 @@ export function ClipCard({ moment, view, onPreview, onAction, onReanalyze }: Cli
       await onAction(moment.id, action);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function rerender() {
+    setRerendering(true);
+    try {
+      await onRerender(moment.id);
+    } finally {
+      setRerendering(false);
     }
   }
 
@@ -92,9 +106,9 @@ export function ClipCard({ moment, view, onPreview, onAction, onReanalyze }: Cli
         >
           🔥 {moment.viralScore}
         </div>
-        {tiktokStatus === "processing" && (
-          <div className="absolute bottom-2 left-2 rounded-full bg-black/70 px-2 py-0.5 text-xs text-amber-300">
-            Processing 9:16…
+        {badge && (
+          <div className={`absolute bottom-2 left-2 rounded-full bg-black/70 px-2 py-0.5 text-xs font-medium ${badge.className}`}>
+            {badge.label}
           </div>
         )}
       </button>
@@ -133,7 +147,7 @@ export function ClipCard({ moment, view, onPreview, onAction, onReanalyze }: Cli
           >
             Source ↗
           </a>
-          {tiktokStatus === "ready" && (
+          {renderState === "attempting" && (
             <a
               href={`/api/media/${moment.id}`}
               download
@@ -141,6 +155,11 @@ export function ClipCard({ moment, view, onPreview, onAction, onReanalyze }: Cli
             >
               Download 9:16
             </a>
+          )}
+          {canRerender(renderState) && (
+            <ActionButton onClick={rerender} disabled={rerendering} variant="primary">
+              {rerendering ? "Re-rendering…" : "Re-render 9:16"}
+            </ActionButton>
           )}
 
           {view === "discover" || view === "top" ? (

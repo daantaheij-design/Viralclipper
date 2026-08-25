@@ -92,6 +92,13 @@ enum TikTokVersionStatus {
   ready
   failed
   unavailable // source does not permit / support downloading+re-encoding
+  // The database record says `ready` (or previously did) but the object no
+  // longer exists in storage — e.g. rendered before object storage was
+  // configured, so it only ever lived on ephemeral container disk and was
+  // lost on redeploy. Detected by src/database/renderVerification.ts;
+  // repaired via the "Re-render 9:16" flow (src/jobs/rerender.ts), which
+  // reuses this moment's existing analysis data — no new Claude calls.
+  media_missing
 }
 
 // ---------------------------------------------------------------------------

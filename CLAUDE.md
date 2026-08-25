@@ -154,3 +154,40 @@ returns either `{ type: "stream", path }` for the media route to stream itself, 
 `{ type: "redirect", url }` — a presigned URL — for the route to 302 to). If you add a third
 backend, it only needs to implement that interface; the render job (`jobs/processing.ts`) and the
 media route (`app/api/media/[momentId]/route.ts`) don't change.
+
+## Render status is verified, not just stored — the missing-media repair flow
+
+A `TikTokVersion.status === "ready"` row is never trusted at face value; it means "the last render
+we know about reported success", not "the file is definitely still there" (rendered-before-S3
+clips that only ever lived on ephemeral container disk are the real production case this covers).
+Two things enforce this and must stay in sync if you touch either:
+
+- **`src/database/renderVerification.ts::healStaleReadyStatuses`** is called from both
+  `listMoments()` and `getMomentById()` (`src/database/moments.ts`) — every `ready` clip gets a
+  `storage.exists()` check on read, and a stale one is flipped to the `media_missing`
+  `TikTokVersionStatus` right there (read-repair, no background job). It only ever touches
+  `TikTokVersion.status`, never `DetectedMoment.status` — the moment must stay visible/browsable
+  even when its render is broken, since that's what lets the dashboard badge and "Re-render 9:16"
+  button reach it at all.
+- **`src/jobs/renderCore.ts::performRenderAndUpload`** is the *only* render+upload path — both
+  `jobs/processing.ts` (automatic) and `jobs/rerender.ts::repairRender` (manual "Re-render 9:16",
+  `POST /api/moments/[id]/rerender`) call it, so a fix here can't drift between the two callers.
+  It sets `status: "ready"` **only** after render, upload, *and* a post-upload
+  `storage.exists()` re-check all succeed — an upload call returning success is never trusted on
+  its own (that's exactly how the original bug happened). If verification fails after a
+  successful-looking upload, the result is `media_missing`, never `ready`. Accepts an injectable
+  `RenderDependencies` (`acquireVideo`/`probeVideo`/`renderVerticalClip`/`uploadToStorage`/
+  `verifyStorageObjectExists`) purely so tests can fake the yt-dlp/ffmpeg/network parts while still
+  exercising the real local storage backend — production code never passes `deps`.
+- `repairRender` reuses every already-persisted analysis field (timestamps, category, viral score,
+  `trackedKeyframes`) and **never calls Claude or re-runs discovery/quick-scan/detailed-analysis**
+  — keep it that way if you touch it; a repair must never re-incur Anthropic cost. It logs a
+  `[repair] ...` narrative via `performRenderAndUpload`'s `onStage` callback for production
+  debugging — the automatic pipeline omits `onStage` (defaults to a no-op) so it doesn't gain the
+  same log volume.
+- `src/lib/playerState.ts::deriveRenderDisplayState` is the single source of truth both
+  `ClipCard.tsx` (badge) and `VerticalPlayer.tsx` (player states + "Re-render 9:16" button) derive
+  from a `TikTokVersionStatus` — keep new statuses (or new UI states) added there, not duplicated
+  ad hoc in either component. `VerticalPlayer.tsx` additionally downgrades its own "ready" case to
+  the `media_missing` display on a live `<video onError>` — the persisted status can still be
+  stale between a read-repair check and an actual playback attempt.
