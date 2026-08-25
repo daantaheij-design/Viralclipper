@@ -43,6 +43,16 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   order in `jobs/analysis.ts` or `src/discovery/runDiscovery.ts`, keep `jobs/analysis.test.ts`'s
   structural ordering assertion (`scanSourceCleanliness(...)` appears before `runQuickScan(...)`
   in the source text) meaningful, not just passing by coincidence.
+- **`jobs/analysis.ts` runs two independently-batched stages — never let one setting govern
+  both again.** `runFreeLocalFilteringBatch` (acquisition + cleanliness scan, zero Anthropic cost)
+  is bounded by `settings.freeLocalFilterBatchSize`; `runPaidAnthropicBatch` (the actual quick-scan
+  Anthropic calls, reading only `status: "waiting_for_ai"` candidates) is bounded by
+  `settings.maxQuickScansPerRun`. This split exists because of a real production bug: the free
+  batch was reusing `maxQuickScansPerRun` (default 1), so a several-hundred-video backlog drained
+  at one video per 5-minute worker tick even with Paid AI Analysis off and nothing costing money.
+  If you touch either query, keep them on separate settings — `jobs/analysis.test.ts` has a
+  structural test asserting `runFreeLocalFilteringBatch`'s own source text never references
+  `maxQuickScansPerRun`.
 - **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
   never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
   `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.

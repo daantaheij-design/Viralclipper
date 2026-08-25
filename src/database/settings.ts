@@ -7,6 +7,15 @@ export interface DiscoverySettings {
   enabledCategories: Category[];
   minViralScore: number;
   candidatesPerRun: number;
+  // How many already-discovered SourceVideo candidates go through the FREE
+  // local stage (acquisition + src/analysis/sourceCleanliness.ts) per
+  // analysis tick. Deliberately independent of maxQuickScansPerRun below —
+  // this batch costs bandwidth/ffmpeg time only, never Anthropic $, so it
+  // can safely be much larger. See src/jobs/analysis.ts.
+  freeLocalFilterBatchSize: number;
+  // How many `waiting_for_ai` candidates may receive an actual PAID
+  // Anthropic quick-scan call per analysis tick. Never governs the free
+  // local stage above.
   maxQuickScansPerRun: number;
   maxDetailedAnalysesPerRun: number;
   maxRendersPerRun: number;
@@ -40,6 +49,7 @@ export const DEFAULT_SETTINGS: DiscoverySettings = {
   enabledCategories: ["road_rage"],
   minViralScore: 70,
   candidatesPerRun: 20,
+  freeLocalFilterBatchSize: 25,
   maxQuickScansPerRun: 1,
   maxDetailedAnalysesPerRun: 1,
   maxRendersPerRun: 1,
