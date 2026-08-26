@@ -30,8 +30,25 @@ export interface AnalysisRunSummary {
   // PAID Anthropic processing — governed by maxQuickScansPerRun /
   // maxDetailedAnalysesPerRun / the AI budget gate. Only runs at all when
   // Paid AI Analysis is on and a real ANTHROPIC_API_KEY is configured.
-  anthropicCallsAttempted: number; // real (non-blocked) quick-scan attempts this tick
+  //
+  // anthropicRequestsAttempted/Completed/quickScans/detailedAnalyses/
+  // actualCostUsd are all derived AFTER the batch by querying the
+  // persisted `ApiUsage` rows for this tick's runToken (see
+  // summarizePersistedUsage below) — never accumulated purely in-memory. This
+  // exists because of a real production incident where a worker tick's
+  // own log claimed `anthropicCalls: 0` while the dashboard (reading the
+  // same ApiUsage table) showed 2 new calls: the in-memory counter was
+  // counting CANDIDATES, not requests, and could drift from what was
+  // actually persisted. Deriving from ApiUsage makes that class of bug
+  // structurally impossible — the summary can never claim fewer completed
+  // requests than rows that actually exist for this run.
+  anthropicRequestsAttempted: number; // reservation attempts this tick, including budget-blocked ones (in-memory — blocked attempts leave no ApiUsage row)
+  anthropicRequestsCompleted: number; // COUNT(*) of ApiUsage rows for this runToken — real, billed Anthropic calls
+  quickScans: number; // of those, operation = "quick_scan"
+  detailedAnalyses: number; // of those, operation = "detailed_analysis"
+  paidCandidatesProcessed: number; // COUNT(DISTINCT sourceVideoId) among this run's ApiUsage rows
   momentsFound: number;
+  actualCostUsd: number; // SUM(costUsd) of this run's ApiUsage rows — the real, reconciled spend
 
   /** True if this call did no work because a previous analysis batch was still running (DB-backed lock — see database/jobLock.ts). */
   skippedAlreadyRunning?: boolean;
@@ -44,8 +61,27 @@ const ANALYSIS_LOCK_NAME = "analysis";
 // abandoned by a crashed holder.
 const ANALYSIS_STALE_AFTER_MS = 30 * 60 * 1000;
 
+// How many times one candidate may enter the PAID batch
+// (runPaidAnalysisOnVideo) before it's parked as a terminal `ai_failed`
+// instead of being retried again — bounds worst-case repeated acquisition
+// + Anthropic-attempt cycles for one stubborn candidate (e.g. one that
+// keeps hitting the budget gate, or whose analysis keeps throwing). See
+// `SourceVideo.paidAnalysisAttempts`'s schema comment.
+const MAX_PAID_ANALYSIS_ATTEMPTS = 3;
+
 function emptySummary(): AnalysisRunSummary {
-  return { videosScanned: 0, dirtyLeads: 0, waitingForAi: 0, anthropicCallsAttempted: 0, momentsFound: 0 };
+  return {
+    videosScanned: 0,
+    dirtyLeads: 0,
+    waitingForAi: 0,
+    anthropicRequestsAttempted: 0,
+    anthropicRequestsCompleted: 0,
+    quickScans: 0,
+    detailedAnalyses: 0,
+    paidCandidatesProcessed: 0,
+    momentsFound: 0,
+    actualCostUsd: 0,
+  };
 }
 
 /**
@@ -83,8 +119,16 @@ async function runAnalysisLocked(): Promise<AnalysisRunSummary> {
 
   const aiAvailable = settings.paidAiAnalysisEnabled && Boolean(env.anthropicApiKey);
   const paid = aiAvailable && !local.environmentBroken
-    ? await runPaidAnthropicBatch(settings.maxQuickScansPerRun, settings.maxDetailedAnalysesPerRun, now)
-    : { anthropicCallsAttempted: 0, momentsFound: 0 };
+    ? await runPaidAnthropicBatch(settings.maxQuickScansPerRun, settings.maxDetailedAnalysesPerRun, settings.minViralScore, now)
+    : {
+        anthropicRequestsAttempted: 0,
+        anthropicRequestsCompleted: 0,
+        quickScans: 0,
+        detailedAnalyses: 0,
+        paidCandidatesProcessed: 0,
+        momentsFound: 0,
+        actualCostUsd: 0,
+      };
 
   console.log("[worker] local filtering done", {
     processed: local.videosScanned,
@@ -95,12 +139,17 @@ async function runAnalysisLocked(): Promise<AnalysisRunSummary> {
   });
   if (aiAvailable) {
     console.log("[worker] paid Anthropic processing done", {
-      anthropicCalls: paid.anthropicCallsAttempted,
+      anthropicRequestsAttempted: paid.anthropicRequestsAttempted,
+      anthropicRequestsCompleted: paid.anthropicRequestsCompleted,
+      quickScans: paid.quickScans,
+      detailedAnalyses: paid.detailedAnalyses,
+      paidCandidatesProcessed: paid.paidCandidatesProcessed,
       momentsFound: paid.momentsFound,
+      actualCostUsd: Number(paid.actualCostUsd.toFixed(4)),
     });
   } else {
     console.log("[worker] paid Anthropic processing skipped (Paid AI Analysis is OFF or ANTHROPIC_API_KEY is unset)", {
-      anthropicCalls: 0,
+      anthropicRequestsCompleted: 0,
     });
   }
 
@@ -108,8 +157,13 @@ async function runAnalysisLocked(): Promise<AnalysisRunSummary> {
     videosScanned: local.videosScanned,
     dirtyLeads: local.dirtyLeads,
     waitingForAi: local.waitingForAi,
-    anthropicCallsAttempted: paid.anthropicCallsAttempted,
+    anthropicRequestsAttempted: paid.anthropicRequestsAttempted,
+    anthropicRequestsCompleted: paid.anthropicRequestsCompleted,
+    quickScans: paid.quickScans,
+    detailedAnalyses: paid.detailedAnalyses,
+    paidCandidatesProcessed: paid.paidCandidatesProcessed,
     momentsFound: paid.momentsFound,
+    actualCostUsd: paid.actualCostUsd,
   };
 }
 
@@ -275,31 +329,39 @@ async function runLocalFilterOnVideo(
 // ---------------------------------------------------------------------------
 
 interface PaidAnthropicBatchResult {
-  anthropicCallsAttempted: number;
+  anthropicRequestsAttempted: number;
+  anthropicRequestsCompleted: number;
+  quickScans: number;
+  detailedAnalyses: number;
+  paidCandidatesProcessed: number;
   momentsFound: number;
+  actualCostUsd: number;
 }
 
 async function runPaidAnthropicBatch(
   maxQuickScans: number,
   maxDetailedAnalyses: number,
+  minViralScore: number,
   now: Date,
 ): Promise<PaidAnthropicBatchResult> {
   const candidates = await prisma.sourceVideo.findMany({
-    where: { AND: [{ status: "waiting_for_ai" }, acquisitionEligible(now)] },
+    where: {
+      AND: [{ status: "waiting_for_ai" }, { paidAnalysisAttempts: { lt: MAX_PAID_ANALYSIS_ATTEMPTS } }, acquisitionEligible(now)],
+    },
     orderBy: { preliminaryScore: "desc" },
     take: maxQuickScans,
     include: { source: true },
   });
 
   const runToken = generateRunToken();
-  let anthropicCallsAttempted = 0;
+  let anthropicRequestsAttempted = 0;
   let momentsFound = 0;
   const circuitBreaker = new AcquisitionCircuitBreaker();
 
   for (const video of candidates) {
-    const result = await runPaidAnalysisOnVideo(video, maxDetailedAnalyses, runToken);
+    const result = await runPaidAnalysisOnVideo(video, maxDetailedAnalyses, minViralScore, runToken);
     momentsFound += result.momentsFound;
-    if (result.attempted) anthropicCallsAttempted++;
+    anthropicRequestsAttempted += result.requestsAttempted;
 
     if (result.environmentBroken) {
       await logError(
@@ -327,30 +389,90 @@ async function runPaidAnthropicBatch(
     }
   }
 
-  return { anthropicCallsAttempted, momentsFound };
+  // Derive the request-level counts from the SAME persisted ApiUsage rows
+  // the cost dashboard reads, scoped to this tick's runToken — never from
+  // the in-memory accumulation above (which only tracks momentsFound and
+  // attempted-including-blocked count; both of those are diagnostic, not
+  // the source of truth for "how many real Anthropic calls happened").
+  const persisted = await summarizePersistedUsage(runToken);
+
+  return {
+    anthropicRequestsAttempted: Math.max(anthropicRequestsAttempted, persisted.completed),
+    anthropicRequestsCompleted: persisted.completed,
+    quickScans: persisted.quickScans,
+    detailedAnalyses: persisted.detailedAnalyses,
+    paidCandidatesProcessed: persisted.uniqueSourceVideoIds,
+    momentsFound,
+    actualCostUsd: persisted.actualCostUsd,
+  };
+}
+
+export interface PersistedUsageSummary {
+  completed: number;
+  quickScans: number;
+  detailedAnalyses: number;
+  uniqueSourceVideoIds: number;
+  actualCostUsd: number;
+}
+
+/**
+ * Reads back this run's actual Anthropic usage from `ApiUsage` — the single
+ * source of truth a worker summary must never contradict (see
+ * AnalysisRunSummary's doc comment). Exported (not just internal) so tests
+ * can seed real ApiUsage rows and verify this derivation directly, without
+ * needing a real Anthropic call to produce them.
+ */
+export async function summarizePersistedUsage(runToken: string): Promise<PersistedUsageSummary> {
+  const rows = await prisma.apiUsage.findMany({
+    where: { provider: "anthropic", runToken },
+    select: { operation: true, sourceVideoId: true, costUsd: true },
+  });
+
+  const uniqueSourceVideoIds = new Set(rows.map((r) => r.sourceVideoId).filter((id): id is string => Boolean(id)));
+
+  return {
+    completed: rows.length,
+    quickScans: rows.filter((r) => r.operation === "quick_scan").length,
+    detailedAnalyses: rows.filter((r) => r.operation === "detailed_analysis").length,
+    uniqueSourceVideoIds: uniqueSourceVideoIds.size,
+    actualCostUsd: rows.reduce((sum, r) => sum + r.costUsd, 0),
+  };
 }
 
 interface PaidAnalysisResult {
   momentsFound: number;
-  /** A real (non-blocked) quick-scan request was made — this is what maxQuickScansPerRun is actually counting. */
-  attempted: boolean;
+  /** Reservation attempts made for this candidate this call (quick scan + however many detailed-analysis windows were tried), whether or not each was budget-blocked. Diagnostic only — anthropicRequestsCompleted is what's authoritative. */
+  requestsAttempted: number;
   aiBudgetBlocked: boolean;
   wasAccessBlocked: boolean;
   environmentBroken: boolean;
 }
 
 function emptyPaidResult(): PaidAnalysisResult {
-  return { momentsFound: 0, attempted: false, aiBudgetBlocked: false, wasAccessBlocked: false, environmentBroken: false };
+  return { momentsFound: 0, requestsAttempted: 0, aiBudgetBlocked: false, wasAccessBlocked: false, environmentBroken: false };
 }
 
 async function runPaidAnalysisOnVideo(
   video: SourceVideoWithSource,
   maxDetailedAnalyses: number,
+  minViralScore: number,
   runToken: string,
 ): Promise<PaidAnalysisResult> {
   const scratchDir = scratchDirForSourceVideo(video.id);
   let momentsFound = 0;
-  await prisma.sourceVideo.update({ where: { id: video.id }, data: { status: "scanning" } });
+  let requestsAttempted = 0;
+  // Incremented unconditionally as this candidate enters the paid batch —
+  // see MAX_PAID_ANALYSIS_ATTEMPTS / SourceVideo.paidAnalysisAttempts's
+  // schema comment. Distinct from `ai_processing` being merely a status:
+  // this is what makes a stubborn candidate (repeatedly budget-blocked,
+  // repeatedly erroring) eventually stop being re-selected, rather than
+  // silently retrying forever every worker tick.
+  const attemptsSoFar = video.paidAnalysisAttempts + 1;
+  await prisma.sourceVideo.update({
+    where: { id: video.id },
+    data: { status: "ai_processing", paidAnalysisAttempts: attemptsSoFar },
+  });
+  const attemptsExhausted = attemptsSoFar >= MAX_PAID_ANALYSIS_ATTEMPTS;
 
   try {
     // Re-acquire: the free stage's scratch file was already cleaned up
@@ -381,6 +503,7 @@ async function runPaidAnalysisOnVideo(
     let windows;
     let quickScanCost;
     try {
+      requestsAttempted++;
       const result = await runQuickScan(acquired.filePath, scratchDir, info, video.category, {
         runToken,
         sourceVideoId: video.id,
@@ -394,10 +517,26 @@ async function runPaidAnalysisOnVideo(
           where: { id: quickScanJob.id },
           data: { status: "failed", finishedAt: new Date(), errorMessage: err.message },
         });
-        // Back to waiting_for_ai — it just didn't get its turn (or the
-        // budget ran out) this tick, not a failure.
-        await prisma.sourceVideo.update({ where: { id: video.id }, data: { status: "waiting_for_ai" } });
-        return { ...emptyPaidResult(), aiBudgetBlocked: true };
+        if (attemptsExhausted) {
+          // Budget-blocked MAX_PAID_ANALYSIS_ATTEMPTS times in a row — no
+          // Anthropic cost was ever incurred for this candidate, but
+          // leaving it in waiting_for_ai would mean it keeps getting
+          // re-selected (and re-acquired) every tick indefinitely. Park it
+          // as a terminal, clearly-labeled failure instead of silently
+          // stranding it outside every query this batch uses.
+          await prisma.sourceVideo.update({
+            where: { id: video.id },
+            data: {
+              status: "ai_failed",
+              errorMessage: `Blocked by the AI budget/availability gate on all ${attemptsSoFar} paid-analysis attempts: ${err.message}`,
+            },
+          });
+        } else {
+          // Back to waiting_for_ai — it just didn't get its turn (or the
+          // budget ran out) this tick, not a failure.
+          await prisma.sourceVideo.update({ where: { id: video.id }, data: { status: "waiting_for_ai" } });
+        }
+        return { ...emptyPaidResult(), requestsAttempted, aiBudgetBlocked: true };
       }
       throw err;
     }
@@ -410,13 +549,14 @@ async function runPaidAnalysisOnVideo(
     if (windows.length === 0) {
       await prisma.sourceVideo.update({
         where: { id: video.id },
-        data: { status: "no_candidates", accessFailureCount: 0, nextRetryAt: null },
+        data: { status: "ai_rejected_quick", accessFailureCount: 0, nextRetryAt: null },
       });
-      return { ...emptyPaidResult(), attempted: true };
+      return { ...emptyPaidResult(), requestsAttempted };
     }
 
     let detailedAnalysesUsed = 0;
     let blockedMidLoop = false;
+    let hasQualifyingMoment = false;
     for (const window of windows) {
       if (detailedAnalysesUsed >= maxDetailedAnalyses) break;
       detailedAnalysesUsed++;
@@ -435,6 +575,7 @@ async function runPaidAnalysisOnVideo(
       });
 
       try {
+        requestsAttempted++;
         const { moments, costUsd } = await runDetailedAnalysis(acquired.filePath, scratchDir, info, video.category, window, {
           runToken,
           sourceVideoId: video.id,
@@ -450,6 +591,7 @@ async function runPaidAnalysisOnVideo(
         });
 
         for (const moment of moments) {
+          const viralScore = computeViralScore(moment.scores);
           await prisma.detectedMoment.create({
             data: {
               sourceVideoId: video.id,
@@ -462,7 +604,7 @@ async function runPaidAnalysisOnVideo(
               peakSeconds: moment.peak_seconds,
               endSeconds: moment.end_seconds,
               scores: moment.scores,
-              viralScore: computeViralScore(moment.scores),
+              viralScore,
               confidence: moment.confidence,
               trackedKeyframes: moment.tracked_keyframes.map((k) => ({
                 timeSeconds: k.time_seconds,
@@ -472,6 +614,7 @@ async function runPaidAnalysisOnVideo(
             },
           });
           momentsFound++;
+          if (viralScore >= minViralScore) hasQualifyingMoment = true;
         }
       } catch (err) {
         if (err instanceof AiBudgetBlockedError) {
@@ -500,25 +643,34 @@ async function runPaidAnalysisOnVideo(
       }
     }
 
+    // Precisely three distinguishable outcomes once quick scan found at
+    // least one window and detailed analysis ran: a real, qualifying
+    // moment ("scanned" — eligible for render/Top Clips); moments were
+    // found but none cleared minViralScore ("ai_rejected_below_score" — a
+    // real result, not a failure); or detailed analysis ran but produced
+    // zero DetectedMoment rows at all ("ai_rejected_detailed"). Never
+    // collapse these back into one bucket — that's exactly what made
+    // rejected candidates look like they'd silently vanished.
+    const finalStatus = hasQualifyingMoment ? "scanned" : momentsFound > 0 ? "ai_rejected_below_score" : "ai_rejected_detailed";
     await prisma.sourceVideo.update({
       where: { id: video.id },
       data: {
-        status: momentsFound > 0 ? "scanned" : "no_candidates",
+        status: finalStatus,
         accessFailureCount: 0,
         nextRetryAt: null,
       },
     });
 
-    return { ...emptyPaidResult(), momentsFound, attempted: true, aiBudgetBlocked: blockedMidLoop };
+    return { ...emptyPaidResult(), momentsFound, requestsAttempted, aiBudgetBlocked: blockedMidLoop };
   } catch (err) {
     await logError("quick_scan", `Paid analysis failed for source video ${video.id}`, err, {
       sourceVideoId: video.id,
     });
     await prisma.sourceVideo.update({
       where: { id: video.id },
-      data: { status: "error", errorMessage: err instanceof Error ? err.message : String(err) },
+      data: { status: "ai_failed", errorMessage: err instanceof Error ? err.message : String(err) },
     });
-    return emptyPaidResult();
+    return { ...emptyPaidResult(), requestsAttempted };
   } finally {
     await cleanupScratchDir(scratchDir);
   }

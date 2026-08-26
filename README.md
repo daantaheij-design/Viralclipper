@@ -151,11 +151,69 @@ of Claude calls.
   past 30 minutes (a crashed holder) is treated as abandoned and can be reclaimed.
 - **The Settings/cost dashboard is the source of truth**, not just a display: it shows the full
   discovery funnel (discovered → rejected by metadata/category/dirty-source → pending local
-  filtering → clean candidates/waiting for AI → sent to Anthropic → detailed analyses → good
-  moments), confirmed vs. reserved/in-flight spend, remaining budget, and a prominent
-  `AI BUDGET REACHED — PAID ANALYSIS PAUSED` banner at 100%. Every funnel number is a real database
-  status count (`GET /api/stats`), never a client-side estimate. Local ffmpeg/CV processing cost is
-  never mixed into the Anthropic spend numbers (local gates never write an `ApiUsage` row).
+  filtering → clean candidates/waiting for AI → currently processing by AI → rejected by quick AI
+  / after detailed AI / below viral score → AI failures → good moments), confirmed vs.
+  reserved/in-flight spend, remaining budget, and a prominent `AI BUDGET REACHED — PAID ANALYSIS
+  PAUSED` banner at 100%. Every funnel number is a real database status count (`GET /api/stats`),
+  never a client-side estimate or in-memory worker-tick tally. Local ffmpeg/CV processing cost is
+  never mixed into the Anthropic spend numbers (local gates never write an `ApiUsage` row). "Videos
+  sent to Anthropic" and "Anthropic API requests" are shown as two distinct numbers — one video's
+  quick scan can span several requests (`quickScan.ts` batches 40 frames per call), and a video
+  that reaches detailed analysis makes at least two — conflating them is exactly what made an
+  earlier production dashboard's "Sent to Anthropic: 12 → 14" reading ambiguous.
+
+#### A second production incident: honest estimates, an explicit state machine, and a truthful summary
+
+The gate above stops runaway *volume*, but a first controlled paid test after it shipped surfaced
+three further gaps, all fixed here:
+
+- **The pre-call cost estimate was too optimistic for real footage.** `src/ai/pricing.ts` used to
+  assume a flat 1600 tokens/image; real source frames go out at native resolution (commonly 1080p+
+  — `video/ffmpeg.ts::extractFrames` never resizes them), and Anthropic's own image-tokenization
+  approximation (`tokens ≈ width_px * height_px / 750`) puts a real 1080p frame well above that
+  flat guess. Every individual reservation could look "within budget" at approval time while the
+  *sum* of several honest-looking reservations still let actual confirmed spend land above the
+  cap (a $1.00 daily budget producing ~$1.10 of real spend in production). `estimateMaxCostUsd`
+  now takes the frame's real `width`/`height` (threaded through from `quickScan.ts`/
+  `detailedAnalysis.ts`'s existing `VideoInfo`) and applies a 1.25x safety margin on top of the
+  real formula, falling back to a higher, explicitly-conservative flat estimate only when
+  dimensions are genuinely unavailable. Quick scan and detailed analysis still take fully separate
+  reservations (`reserveAiBudget` is called once per `analyzeFrames` call), so a quick scan that
+  consumes most of a tight budget correctly blocks the detailed-analysis reservation that follows
+  it, rather than both being individually "approved" against a stale/optimistic total.
+- **Every real Anthropic attempt now logs a structured `[anthropic]` line** —
+  `request starting`/`request blocked`/`request completed` — from the single choke point
+  (`analyzeFrames`), tagged with `sourceVideoId`/`stage`/token & cost figures and (on start) a
+  budget snapshot taken at reservation time. This exists because a worker tick's own summary log
+  once read `anthropicCalls: 0` in the same window the dashboard showed 2 new Anthropic calls; that
+  turned out to be a combination of a log-attribution problem (a different tick, or the web
+  service's own separately-logged `POST /api/discovery/run` background continuation, had done the
+  real work) and a counting-semantics bug (the old counter counted *candidates*, not *requests*, so
+  even a correctly-attributed tick undercounted a candidate that got both a quick scan and a
+  detailed analysis). Grepping for `[anthropic]` in any one service's log now answers "did *this*
+  process make a real Anthropic call" directly, without trusting a possibly-stale summary computed
+  elsewhere.
+- **The worker/analysis summary (`AnalysisRunSummary`) is derived from persisted `ApiUsage` rows,
+  never accumulated purely in-memory.** `jobs/analysis.ts::runPaidAnthropicBatch` queries
+  `ApiUsage` scoped to the tick's own `runToken` *after* the batch completes
+  (`summarizePersistedUsage`) for `anthropicRequestsCompleted`/`quickScans`/`detailedAnalyses`/
+  `paidCandidatesProcessed`/`actualCostUsd` — the exact fix for "must never say 0 calls when 2 were
+  persisted." `anthropicRequestsAttempted` (which also counts budget-blocked attempts that leave no
+  `ApiUsage` row) stays diagnostic/in-memory, but every *completed*-call number is DB-sourced by
+  construction.
+- **`SourceVideo.status` now distinguishes every paid outcome explicitly**: `ai_processing` (in the
+  paid batch right now — distinct from the free stage's `scanning`), `ai_rejected_quick` (quick
+  scan found zero candidate windows), `ai_rejected_detailed` (detailed analysis ran but produced
+  zero moments), `ai_rejected_below_score` (moments were found, but none reached
+  `minViralScore` — a real result, not a failure), `ai_failed` (an unexpected exception during the
+  paid stage itself), and a redefined `scanned` (at least one *qualifying* moment exists — the
+  actual bar for reaching Top Clips). A candidate leaves `waiting_for_ai` into one of these
+  terminal states, or back to `waiting_for_ai` only when the AI budget/availability gate blocked it
+  (a genuinely retryable, no-cost-incurred outcome) — never silently re-processed every tick.
+  `SourceVideo.paidAnalysisAttempts` is incremented every time a candidate enters the paid batch
+  and hard-capped at `MAX_PAID_ANALYSIS_ATTEMPTS` (3, in `jobs/analysis.ts`); a candidate that's
+  exhausted its attempts — including one repeatedly budget-blocked — is excluded from future paid
+  batches and parked as `ai_failed` rather than being retried forever.
 
 ### Media acquisition: being discovered ≠ being downloadable
 

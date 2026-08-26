@@ -71,6 +71,31 @@ enum VideoProcessingStatus {
   // resumes from here (re-acquisition + the free cleanliness scan are cheap
   // to redo; no Anthropic cost was ever incurred).
   waiting_for_ai
+  // Currently inside the PAID Anthropic batch (src/jobs/analysis.ts::
+  // runPaidAnalysisOnVideo) — distinct from `scanning` (which the FREE
+  // local-filtering batch also uses) so "mid-paid-processing" is never
+  // ambiguous with "mid-free-filtering" on the dashboard/in queries.
+  ai_processing
+  // The quick scan completed and found zero candidate windows — never
+  // reached detailed analysis. Distinct from `ai_failed` (an error) and
+  // `ai_rejected_below_score` (moments were found, just not good enough).
+  ai_rejected_quick
+  // Detailed analysis ran for every quick-scan window but every one
+  // reported `interesting_moment: false` (or all returned moments were
+  // outside the window's bounds) — zero DetectedMoment rows created.
+  ai_rejected_detailed
+  // At least one DetectedMoment was created, but none scored >=
+  // minViralScore — a real result, not a failure or a rejection at the
+  // Claude level. Kept distinct from `scanned` (which now means "at least
+  // one qualifying moment exists") so the dashboard/logs can show this
+  // explicitly instead of it looking like the candidate just vanished.
+  ai_rejected_below_score
+  // An unexpected exception during the PAID stage specifically (acquisition
+  // failures during re-acquisition use their own existing statuses —
+  // `error`/`source_access_blocked` — via the shared acquireSourceFile
+  // helper; this is for a genuine quick-scan/detailed-analysis-stage
+  // failure after acquisition succeeded).
+  ai_failed
   error
 }
 
@@ -266,6 +291,14 @@ model SourceVideo {
   // string generation from title/metadata — no discovery API calls made
   // automatically; see README's "Dirty leads" section) — string[].
   cleanSourceQueries      Json?
+
+  // How many times this candidate has entered the PAID batch
+  // (src/jobs/analysis.ts::runPaidAnalysisOnVideo) — incremented before
+  // each attempt. A hard cap (MAX_PAID_ANALYSIS_ATTEMPTS) excludes it from
+  // future paid batches once reached, so repeatedly re-queuing the same
+  // candidate (e.g. via "Analyze Again") can't loop unboundedly through
+  // paid Anthropic calls.
+  paidAnalysisAttempts Int @default(0)
 
   analysisJobs          AnalysisJob[]
   candidateWindows      CandidateWindow[]

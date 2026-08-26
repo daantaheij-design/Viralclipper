@@ -80,6 +80,7 @@ export async function runQuickScan(
         sourceVideoId: ctx.sourceVideoId,
         analysisJobId: ctx.analysisJobId,
         maxTokens: 4000,
+        frameDimensions: { width: video.width, height: video.height },
       });
       costUsd += result.costUsd;
 

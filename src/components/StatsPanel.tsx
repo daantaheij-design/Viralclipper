@@ -21,10 +21,17 @@ interface Stats {
     rejectedDirtySource: number;
     pendingLocalFiltering: number;
     cleanCandidates: number;
-    sentToAnthropic: number;
+    aiProcessing: number;
+    rejectedByQuickAi: number;
+    rejectedByDetailedAi: number;
+    rejectedBelowScore: number;
+    aiFailures: number;
+    videosSentToAnthropic: number;
+    anthropicApiRequests: number;
     detailedAnalyses: number;
     goodMoments: number;
     waitingForAi: number;
+    actualCostTodayUsd: number;
   };
   budget: {
     paidAiAnalysisEnabled: boolean;
@@ -113,15 +120,28 @@ export function StatsPanel() {
           <FunnelRow label="Rejected — dirty source" value={stats.funnel.rejectedDirtySource} dim />
           <FunnelRow label="Pending local filtering" value={stats.funnel.pendingLocalFiltering} dim />
           <FunnelRow label="Clean candidates / waiting for AI" value={stats.funnel.cleanCandidates} />
-          <FunnelRow label="Sent to Anthropic (quick scans)" value={stats.funnel.sentToAnthropic} />
-          <FunnelRow label="Detailed analyses" value={stats.funnel.detailedAnalyses} />
+          <FunnelRow label="Currently processing by AI" value={stats.funnel.aiProcessing} />
+          <FunnelRow label="Videos sent to Anthropic (all time)" value={stats.funnel.videosSentToAnthropic} />
+          <FunnelRow label="Anthropic API requests (all time)" value={stats.funnel.anthropicApiRequests} dim />
+          <FunnelRow label="Detailed analyses" value={stats.funnel.detailedAnalyses} dim />
+          <FunnelRow label="Rejected by quick AI scan" value={stats.funnel.rejectedByQuickAi} dim />
+          <FunnelRow label="Rejected after detailed AI" value={stats.funnel.rejectedByDetailedAi} dim />
+          <FunnelRow label="Rejected — below viral score" value={stats.funnel.rejectedBelowScore} dim />
+          <FunnelRow label="AI failures" value={stats.funnel.aiFailures} dim />
           <FunnelRow label="Good moments" value={stats.funnel.goodMoments} />
+          <div className="flex items-center justify-between border-b border-border/50 py-2 text-sm last:border-0">
+            <span className="text-foreground">Actual AI cost today</span>
+            <span className="font-mono font-medium text-foreground">{formatUsd(stats.funnel.actualCostTodayUsd)}</span>
+          </div>
           <p className="mt-2 border-t border-border/50 pt-2 text-[11px] text-muted">
             &ldquo;Pending local filtering&rdquo; is the free backlog (acquisition + cleanliness scan,
             zero Anthropic cost) — each worker tick drains up to your Free local filter batch size
-            from it. &ldquo;Clean candidates / waiting for AI&rdquo; is parked and ready; it only
-            moves to &ldquo;Sent to Anthropic&rdquo; once Paid AI Analysis is on, one batch of
-            Max quick scans per run at a time.
+            from it. &ldquo;Clean candidates / waiting for AI&rdquo; is parked and ready; it only moves
+            to &ldquo;Currently processing by AI&rdquo; once Paid AI Analysis is on, one batch of Max
+            quick scans per run at a time. &ldquo;Videos sent to Anthropic&rdquo; counts distinct
+            videos; &ldquo;Anthropic API requests&rdquo; counts individual calls — one video&rsquo;s
+            quick scan can span several requests, and a video that reaches detailed analysis makes
+            at least two.
           </p>
         </div>
 

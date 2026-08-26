@@ -53,6 +53,23 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   If you touch either query, keep them on separate settings — `jobs/analysis.test.ts` has a
   structural test asserting `runFreeLocalFilteringBatch`'s own source text never references
   `maxQuickScansPerRun`.
+- **A candidate's paid-AI outcome is one of six explicit terminal-ish `SourceVideo` statuses —
+  never collapse them back together.** `ai_processing` (transient, set the moment
+  `runPaidAnalysisOnVideo` picks a candidate up), `ai_rejected_quick` (zero candidate windows),
+  `ai_rejected_detailed` (windows existed but zero moments), `ai_rejected_below_score` (moments
+  existed but none reached `settings.minViralScore` — a real result, not a failure), `ai_failed`
+  (an unexpected exception during the paid stage itself), and `scanned` (now specifically means "at
+  least one *qualifying* moment exists"). Only a genuine AI-budget/availability block reverts a
+  candidate to `waiting_for_ai`; every other outcome is terminal. `SourceVideo.paidAnalysisAttempts`
+  is incremented unconditionally every time a candidate enters `runPaidAnalysisOnVideo` and the
+  paid-batch query excludes anything at or past `MAX_PAID_ANALYSIS_ATTEMPTS` — keep that filter and
+  the increment in sync if you touch either, or a stubborn candidate (e.g. repeatedly
+  budget-blocked) can end up retried forever instead of eventually parked as `ai_failed`. See
+  README's "A second production incident" subsection for the full story and
+  `jobs/analysis.ts::summarizePersistedUsage` for why the worker's own summary counts
+  (`anthropicRequestsCompleted`/`quickScans`/`detailedAnalyses`/`paidCandidatesProcessed`/
+  `actualCostUsd`) are derived from persisted `ApiUsage` rows rather than accumulated in-memory —
+  never reintroduce an in-memory counter as the source of truth for those fields.
 - **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
   never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
   `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.
