@@ -5,6 +5,7 @@ import { prisma } from "@/database/client";
 import { updateSettings } from "@/database/settings";
 import { env } from "@/lib/env";
 import { commitReservation, getBudgetStatus, releaseReservation, reserveAiBudget } from "./budget";
+import { estimateMaxCostUsd } from "./pricing";
 
 /**
  * Real Postgres throughout — no mocking of the reservation transaction
@@ -220,6 +221,57 @@ test("reserveAiBudget: atomic reservation prevents concurrent overspend past the
     assert.equal(succeeded.length, 1, `expected exactly 1 of 5 concurrent $0.06 reservations to fit a $0.10 budget, got ${succeeded.length}`);
 
     for (let i = 0; i < 5; i++) await cleanup(`${runToken}-${i}`);
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanup(runToken);
+  }
+});
+
+test("reserveAiBudget: quick scan + detailed analysis use SEPARATE reservations, and detailed does not start if it would knowingly exceed the daily budget (production incident regression)", async () => {
+  const runToken = randomUUID();
+  // $1.00 daily budget, exactly like the production incident report.
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 1.0, perRunAiBudgetUsd: 0, maxConcurrentAnthropicCalls: 5 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  try {
+    // Realistic native-resolution (1080p) frames, exactly the scenario
+    // pricing.ts's conservative estimate exists for — a full 40-frame
+    // quickScan.ts batch, then a 90-frame detailedAnalysis.ts window.
+    const quickScanEstimate = estimateMaxCostUsd("claude-opus-5", 40, 4000, { width: 1920, height: 1080 });
+    const detailedEstimate = estimateMaxCostUsd("claude-opus-5", 90, 4000, { width: 1920, height: 1080 });
+
+    const quickScanReservation = await reserveAiBudget({ kind: "quick_scan", estimatedCostUsd: quickScanEstimate, runToken });
+    assert.equal(quickScanReservation.ok, true, "the first (quick scan) reservation should fit the $1.00 budget on its own");
+    if (!quickScanReservation.ok) return;
+
+    // Quick scan's actual cost comes in a bit under its conservative
+    // estimate (as real usage normally does) — reconcile it, exactly like
+    // analyzeFrames does after a real response.
+    const quickScanActualCost = quickScanEstimate * 0.7;
+    await commitReservation(quickScanReservation.reservationId, quickScanActualCost);
+
+    // Now try to reserve for detailed analysis. Whether this succeeds or
+    // is blocked, the invariant under test is the same either way: the
+    // gate must never let confirmed + in-flight spend exceed the $1.00 cap
+    // by a call that was started KNOWING it might push over.
+    const detailedReservation = await reserveAiBudget({ kind: "detailed_analysis", estimatedCostUsd: detailedEstimate, runToken });
+
+    if (detailedReservation.ok) {
+      // It fit — prove the reservation math is honest: confirmed quick-scan
+      // cost + this new reservation must not itself already exceed budget.
+      assert.ok(
+        quickScanActualCost + detailedEstimate <= 1.0 + 1e-9,
+        `detailed reservation was granted but quickScanActualCost ($${quickScanActualCost}) + detailedEstimate ($${detailedEstimate}) exceeds the $1.00 daily budget`,
+      );
+      await commitReservation(detailedReservation.reservationId, detailedEstimate * 0.7);
+    } else {
+      // It was blocked — this is the fix in action: with real 1080p frame
+      // counts, a $1.00 budget cannot conservatively fit both a full quick
+      // scan AND a full detailed analysis, so the gate correctly refuses
+      // to start the second call rather than letting actual spend land at
+      // ~$1.10 the way the production incident did.
+      assert.equal(detailedReservation.reason, "daily_budget_exceeded");
+    }
   } finally {
     env.anthropicApiKey = before;
     await cleanup(runToken);

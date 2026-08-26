@@ -3,6 +3,7 @@ import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { z } from "zod";
 import { env, requireAnthropicKey } from "@/lib/env";
 import { estimateCostUsd, estimateMaxCostUsd } from "@/ai/pricing";
+import type { FrameDimensions } from "@/ai/pricing";
 import { recordApiUsage } from "@/ai/costTracking";
 import { AiBudgetBlockedError, commitReservation, releaseReservation, reserveAiBudget } from "@/ai/budget";
 import type { ReservationKind } from "@/ai/budget";
@@ -36,6 +37,8 @@ export interface VisionAnalysisInput<T extends z.ZodTypeAny> {
   momentId?: string;
   analysisJobId?: string;
   maxTokens?: number;
+  /** Source video's native frame dimensions (frames are never resized before being sent — see video/ffmpeg.ts) — used to make the pre-call cost estimate realistic instead of a flat guess. See src/ai/pricing.ts. */
+  frameDimensions?: FrameDimensions;
 }
 
 export interface VisionAnalysisResult<T> {
@@ -57,12 +60,21 @@ export interface VisionAnalysisResult<T> {
  * when Paid AI Analysis is off, the key is missing, or the daily/per-run/
  * concurrency limits would be exceeded; callers must catch it explicitly
  * (see analysis.ts) rather than let it fall into generic error handling.
+ *
+ * Logs a `[anthropic] request starting`/`request completed` pair for every
+ * real attempt — the production incident that added this (a dashboard
+ * showing 2 new Anthropic calls while a worker tick's own summary claimed
+ * 0) was ultimately a log-attribution problem, not a data-correctness one:
+ * these lines, tagged with sourceVideoId/stage and printed from the one
+ * choke point every call goes through, are what let you grep any service's
+ * log for "did *this* process make an Anthropic call" without relying on
+ * a possibly-stale in-memory summary computed elsewhere.
  */
 export async function analyzeFrames<T extends z.ZodTypeAny>(
   input: VisionAnalysisInput<T>,
 ): Promise<VisionAnalysisResult<z.infer<T>>> {
   const maxTokens = input.maxTokens ?? 8000;
-  const estimatedCostUsd = estimateMaxCostUsd(env.claudeModel, input.frames.length, maxTokens);
+  const estimatedCostUsd = estimateMaxCostUsd(env.claudeModel, input.frames.length, maxTokens, input.frameDimensions);
 
   const reservation = await reserveAiBudget({
     kind: input.operation,
@@ -72,9 +84,25 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
     momentId: input.momentId,
   });
   if (!reservation.ok) {
+    console.log("[anthropic] request blocked", {
+      sourceVideoId: input.sourceVideoId,
+      stage: input.operation,
+      reservationUsd: Number(estimatedCostUsd.toFixed(4)),
+      reason: reservation.reason,
+    });
     throw new AiBudgetBlockedError(reservation.reason, reservation.message);
   }
 
+  console.log("[anthropic] request starting", {
+    sourceVideoId: input.sourceVideoId,
+    stage: input.operation,
+    reservationUsd: Number(estimatedCostUsd.toFixed(4)),
+    dailySpentBefore: Number(reservation.before.confirmedTodayUsd.toFixed(4)),
+    dailyReservedBefore: Number(reservation.before.reservedInFlightUsd.toFixed(4)),
+    runSpentBefore: Number(reservation.before.runConfirmedUsd.toFixed(4)),
+  });
+
+  let committed = false;
   try {
     const content: Anthropic.Messages.ContentBlockParam[] = [];
     for (const frame of input.frames) {
@@ -99,6 +127,7 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
     const costUsd = estimateCostUsd(env.claudeModel, inputTokens, outputTokens);
 
     await commitReservation(reservation.reservationId, costUsd);
+    committed = true;
     await recordApiUsage({
       provider: "anthropic",
       operation: input.operation,
@@ -114,12 +143,34 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
     });
 
     if (response.parsed_output === null) {
+      console.log("[anthropic] request completed", {
+        sourceVideoId: input.sourceVideoId,
+        stage: input.operation,
+        inputTokens,
+        outputTokens,
+        actualCostUsd: Number(costUsd.toFixed(4)),
+        result: "schema_mismatch",
+      });
       throw new Error("Claude vision response did not match the expected schema");
     }
 
+    console.log("[anthropic] request completed", {
+      sourceVideoId: input.sourceVideoId,
+      stage: input.operation,
+      inputTokens,
+      outputTokens,
+      actualCostUsd: Number(costUsd.toFixed(4)),
+      result: "ok",
+    });
+
     return { data: response.parsed_output, inputTokens, outputTokens, costUsd };
   } catch (err) {
-    await releaseReservation(reservation.reservationId);
+    // Only release if the reservation was never committed to an actual
+    // cost — committing already recorded the real spend (the API call
+    // genuinely happened and must count), so releasing afterward would
+    // leave the reservation's own status misleadingly showing "released"
+    // for a request that actually completed and was billed.
+    if (!committed) await releaseReservation(reservation.reservationId);
     throw err;
   }
 }

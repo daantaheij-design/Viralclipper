@@ -51,8 +51,15 @@ export type BudgetBlockReason =
   | "per_run_budget_exceeded"
   | "concurrency_limit_reached";
 
+export interface BudgetSnapshot {
+  confirmedTodayUsd: number;
+  reservedInFlightUsd: number;
+  runConfirmedUsd: number;
+  runReservedUsd: number;
+}
+
 export type ReserveBudgetResult =
-  | { ok: true; reservationId: string }
+  | { ok: true; reservationId: string; before: BudgetSnapshot }
   | { ok: false; reason: BudgetBlockReason; message: string };
 
 // Arbitrary fixed key identifying "the AI budget lock" among any other
@@ -159,7 +166,16 @@ export async function reserveAiBudget(input: ReserveBudgetInput): Promise<Reserv
       },
     });
 
-    return { ok: true, reservationId: reservation.id };
+    return {
+      ok: true,
+      reservationId: reservation.id,
+      before: {
+        confirmedTodayUsd: confirmedToday,
+        reservedInFlightUsd: reservedInFlight,
+        runConfirmedUsd: runConfirmed,
+        runReservedUsd: runReserved,
+      },
+    };
   });
 }
 

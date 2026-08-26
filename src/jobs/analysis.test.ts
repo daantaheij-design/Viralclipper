@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { prisma } from "@/database/client";
 import { updateSettings } from "@/database/settings";
 import { env } from "@/lib/env";
-import { runAnalysis } from "./analysis";
+import { runAnalysis, summarizePersistedUsage } from "./analysis";
 import type { VideoProcessingStatus } from "@/generated/prisma";
 
 async function makeCandidate(titleSuffix: string, status: VideoProcessingStatus = "discovered") {
@@ -70,7 +71,8 @@ test("runAnalysis: free local filtering processes up to freeLocalFilterBatchSize
   try {
     const summary = await runAnalysis();
     assert.equal(summary.videosScanned, 5, `expected freeLocalFilterBatchSize (5) local candidates processed, got ${summary.videosScanned}`);
-    assert.equal(summary.anthropicCallsAttempted, 0, "Paid AI Analysis is off — zero Anthropic attempts");
+    assert.equal(summary.anthropicRequestsCompleted, 0, "Paid AI Analysis is off — zero Anthropic requests");
+    assert.equal(summary.actualCostUsd, 0);
   } finally {
     await cleanupVideos(videos.map((v) => v.id));
   }
@@ -109,7 +111,7 @@ test("runAnalysis: Paid AI Analysis OFF leaves existing waiting_for_ai candidate
   const videos = await Promise.all(Array.from({ length: 4 }, (_, i) => makeCandidate(`parked-${i}`, "waiting_for_ai")));
   try {
     const summary = await runAnalysis();
-    assert.equal(summary.anthropicCallsAttempted, 0);
+    assert.equal(summary.anthropicRequestsCompleted, 0);
     const statuses = await statusesOf(videos.map((v) => v.id));
     assert.ok(
       statuses.every((s) => s === "waiting_for_ai"),
@@ -189,6 +191,121 @@ test("jobs/analysis.ts: the local cleanliness gate runs before any Anthropic cal
     cleanlinessCallIndex < quickScanCallIndex,
     "the local source-cleanliness scan must run before the first Anthropic-calling step (runQuickScan)",
   );
+});
+
+// --- Observability/state/cost-control fixes (production incident follow-up) ---
+
+test("summarizePersistedUsage: derives request-level counts EXACTLY from persisted ApiUsage rows — never fewer than what's actually persisted", async () => {
+  const runToken = randomUUID();
+  const videoAId = `video-a-${randomUUID()}`;
+  const videoBId = `video-b-${randomUUID()}`;
+  try {
+    // Simulates exactly the production incident's shape: one candidate
+    // (video A) got a quick scan AND a detailed analysis (2 requests, 1
+    // candidate); a second, unrelated request landed against video B.
+    await prisma.apiUsage.createMany({
+      data: [
+        { provider: "anthropic", operation: "quick_scan", costUsd: 0.4, sourceVideoId: videoAId, runToken },
+        { provider: "anthropic", operation: "detailed_analysis", costUsd: 0.35, sourceVideoId: videoAId, runToken },
+        { provider: "anthropic", operation: "quick_scan", costUsd: 0.2, sourceVideoId: videoBId, runToken },
+        // A different run's row must never leak into this run's summary.
+        { provider: "anthropic", operation: "quick_scan", costUsd: 999, sourceVideoId: videoAId, runToken: `${runToken}-other` },
+      ],
+    });
+
+    const summary = await summarizePersistedUsage(runToken);
+    assert.equal(summary.completed, 3, "must report exactly the 3 rows persisted for this runToken — never 0, never fewer");
+    assert.equal(summary.quickScans, 2);
+    assert.equal(summary.detailedAnalyses, 1);
+    assert.equal(summary.uniqueSourceVideoIds, 2, "video A contributed 2 requests but is still 1 unique video");
+    assert.ok(Math.abs(summary.actualCostUsd - 0.95) < 1e-9, `expected actualCostUsd ~0.95, got ${summary.actualCostUsd}`);
+  } finally {
+    await prisma.apiUsage.deleteMany({ where: { runToken: { in: [runToken, `${runToken}-other`] } } });
+  }
+});
+
+test("summarizePersistedUsage: zero persisted rows -> zero everywhere (nothing to fabricate)", async () => {
+  const runToken = randomUUID();
+  const summary = await summarizePersistedUsage(runToken);
+  assert.deepEqual(summary, { completed: 0, quickScans: 0, detailedAnalyses: 0, uniqueSourceVideoIds: 0, actualCostUsd: 0 });
+});
+
+test("runAnalysis: a candidate that already reached MAX_PAID_ANALYSIS_ATTEMPTS is excluded from the paid batch (never silently retried forever)", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  const exhausted = await makeCandidate("exhausted", "waiting_for_ai");
+  const fresh = await makeCandidate("fresh", "waiting_for_ai");
+  try {
+    await prisma.sourceVideo.update({ where: { id: exhausted.id }, data: { paidAnalysisAttempts: 3 } });
+
+    await runAnalysis();
+
+    const exhaustedAfter = await prisma.sourceVideo.findUniqueOrThrow({ where: { id: exhausted.id } });
+    assert.equal(exhaustedAfter.status, "waiting_for_ai", "an already-capped candidate must never be re-selected into the paid batch");
+    assert.equal(exhaustedAfter.paidAnalysisAttempts, 3, "its attempt counter must not increment further — it was never touched");
+
+    // The fresh candidate, by contrast, WAS selected (real acquisition
+    // fails for this fake URL in this sandbox with no network egress, but
+    // being touched at all — leaving waiting_for_ai, attempts incremented
+    // — proves it was selected by the paid query, unlike the capped one).
+    const freshAfter = await prisma.sourceVideo.findUniqueOrThrow({ where: { id: fresh.id } });
+    assert.ok(freshAfter.paidAnalysisAttempts >= 1, "expected the fresh candidate to have entered the paid batch and incremented its attempt count");
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanupVideos([exhausted.id, fresh.id]);
+  }
+});
+
+test("runAnalysis: a candidate already in a terminal AI outcome state is never re-selected by a later tick", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  const terminalStatuses: VideoProcessingStatus[] = [
+    "ai_rejected_quick",
+    "ai_rejected_detailed",
+    "ai_rejected_below_score",
+    "ai_failed",
+    "scanned",
+  ];
+  const videos = await Promise.all(terminalStatuses.map((s, i) => makeCandidate(`terminal-${i}`, s)));
+  try {
+    await runAnalysis();
+    const rows = await prisma.sourceVideo.findMany({
+      where: { id: { in: videos.map((v) => v.id) } },
+      select: { id: true, status: true },
+    });
+    for (const video of videos) {
+      const row = rows.find((r) => r.id === video.id);
+      assert.equal(row?.status, video.status, `expected ${video.id} (seeded as ${video.status}) to remain untouched`);
+    }
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanupVideos(videos.map((v) => v.id));
+  }
+});
+
+test("jobs/analysis.ts: runPaidAnthropicBatch's returned counts are derived from summarizePersistedUsage, not a separate in-memory tally (source text)", async () => {
+  const src = await readFile(new URL("./analysis.ts", import.meta.url), "utf8");
+  const batchFnStart = src.indexOf("async function runPaidAnthropicBatch");
+  const batchFnEnd = src.indexOf("interface PersistedUsageSummary");
+  assert.ok(batchFnStart > -1 && batchFnEnd > batchFnStart);
+  const section = src.slice(batchFnStart, batchFnEnd);
+  assert.match(section, /summarizePersistedUsage\(runToken\)/, "the batch result must be derived from the persisted-usage query");
+  assert.match(
+    section,
+    /anthropicRequestsCompleted:\s*persisted\.completed/,
+    "anthropicRequestsCompleted must come from the persisted query result, not an in-memory counter",
+  );
+});
+
+test("jobs/analysis.ts: the paid batch query excludes candidates at or past MAX_PAID_ANALYSIS_ATTEMPTS (source text)", async () => {
+  const src = await readFile(new URL("./analysis.ts", import.meta.url), "utf8");
+  const batchFnStart = src.indexOf("async function runPaidAnthropicBatch");
+  const batchFnEnd = src.indexOf("const runToken = generateRunToken();");
+  assert.ok(batchFnStart > -1 && batchFnEnd > batchFnStart);
+  const section = src.slice(batchFnStart, batchFnEnd);
+  assert.match(section, /paidAnalysisAttempts:\s*\{\s*lt:\s*MAX_PAID_ANALYSIS_ATTEMPTS\s*\}/);
 });
 
 test("jobs/analysis.ts: the free local batch query is never bounded by maxQuickScansPerRun in the source text", async () => {

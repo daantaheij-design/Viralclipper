@@ -18,23 +18,57 @@ export function estimateCostUsd(model: string, inputTokens: number, outputTokens
   return (inputTokens / 1_000_000) * pricing.input + (outputTokens / 1_000_000) * pricing.output;
 }
 
-// Deliberately pessimistic (rounds up) per-image token estimate used only to
-// reserve budget *before* a call is made, when real usage isn't known yet —
-// Claude's actual image tokenization varies with resolution, but this is a
-// safe ceiling for the frame sizes this app extracts (see video/ffmpeg.ts).
-// A reservation that slightly overestimates just blocks a hair earlier than
-// strictly necessary; one that underestimates would let spend slip past the
-// hard cap, which is the one failure mode that isn't acceptable here.
-const ESTIMATED_TOKENS_PER_IMAGE = 1600;
+/**
+ * Deliberately pessimistic (rounds up) per-image token estimate used only
+ * to reserve budget *before* a call is made, when real usage isn't known
+ * yet. Anthropic's documented image-tokenization approximation is
+ * `tokens ≈ (width_px * height_px) / 750`. This matters here specifically
+ * because `video/ffmpeg.ts::extractFrames` never resizes frames before
+ * they're sent to Claude — they go out at the source video's native
+ * resolution, commonly 1080p or higher for real YouTube/dashcam footage.
+ *
+ * A previous flat "1600 tokens/image" estimate implicitly assumed a much
+ * smaller image than that (roughly ~1100x1100) and was a confirmed,
+ * concrete contributor to actual spend exceeding the configured daily
+ * budget in production: each reservation looked "within budget" against an
+ * estimate that undershot the real cost of a full-resolution 1080p+ frame,
+ * so the *sum* of several individually-approved, individually-honest-looking
+ * reservations could still land the day's *actual* total above the cap.
+ * The hard budget gate (src/ai/budget.ts) is only as hard as this estimate
+ * is honest — don't shrink it back down without re-verifying against real
+ * frame sizes and real Anthropic usage.
+ */
+const TOKENS_PER_PIXEL = 1 / 750;
+const ESTIMATE_SAFETY_MARGIN = 1.25; // headroom over the raw formula — tokenization isn't guaranteed to match the approximation exactly
+const FALLBACK_TOKENS_PER_IMAGE = 3200; // used only when frame dimensions are unavailable — a safe ceiling for up to ~1080p (1920x1080 alone is ~2765 before margin)
 const ESTIMATED_PROMPT_OVERHEAD_TOKENS = 800;
+
+export interface FrameDimensions {
+  width: number;
+  height: number;
+}
+
+function estimatedTokensPerImage(dimensions?: FrameDimensions): number {
+  if (!dimensions || !dimensions.width || !dimensions.height) return FALLBACK_TOKENS_PER_IMAGE;
+  return Math.ceil(dimensions.width * dimensions.height * TOKENS_PER_PIXEL * ESTIMATE_SAFETY_MARGIN);
+}
 
 /**
  * Pessimistic upper-bound cost estimate for one `analyzeFrames` call, used
  * to reserve budget before the request is sent (see src/ai/budget.ts). Uses
  * `maxTokens` (the request's own output cap) as the output-token estimate,
- * since actual output can never exceed what was requested.
+ * since actual output can never exceed what was requested. Pass the source
+ * video's actual frame dimensions when known (quickScan.ts/detailedAnalysis.ts
+ * both have `VideoInfo` already) — falls back to a conservative flat
+ * per-image estimate otherwise.
  */
-export function estimateMaxCostUsd(model: string, frameCount: number, maxTokens: number): number {
-  const estimatedInputTokens = frameCount * ESTIMATED_TOKENS_PER_IMAGE + ESTIMATED_PROMPT_OVERHEAD_TOKENS;
+export function estimateMaxCostUsd(
+  model: string,
+  frameCount: number,
+  maxTokens: number,
+  frameDimensions?: FrameDimensions,
+): number {
+  const perImage = estimatedTokensPerImage(frameDimensions);
+  const estimatedInputTokens = frameCount * perImage + ESTIMATED_PROMPT_OVERHEAD_TOKENS;
   return estimateCostUsd(model, estimatedInputTokens, maxTokens);
 }
