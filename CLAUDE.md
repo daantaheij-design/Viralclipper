@@ -83,6 +83,23 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   eligibleForPaidSelection, blockedByAttemptCap, selected }` before every selection — a mismatch
   between `waitingForAiTotal` here and the dashboard's own count is the first thing to check if
   this regresses again.
+- **`quickScan.ts` makes exactly ONE Anthropic request per candidate — never reintroduce a
+  batching loop.** It used to sparsely sample the *entire* source video and batch every 40 frames
+  into its own `analyzeFrames` call; for anything longer than ~60s of footage that was 2+
+  full-priced requests per candidate, all logged identically as `quick_scan` — a real production
+  incident (one candidate: 2 completed ~$0.55 requests + a 3rd correctly budget-blocked, detailed
+  analysis never even got a turn). Quick scan now extracts a small, duration-bounded frame set
+  (`quickScanFrameCount`: 6–12 frames, never more regardless of source length) resized to 512×288
+  (`extractFrames`'s `maxWidth`/`maxHeight` — never send native-resolution frames for quick scan)
+  and makes one call, full stop. `maxQuickAnthropicRequestsPerCandidate` in Settings exists as a
+  documented safety ceiling, not a loop bound this file reads — the real guarantee is structural.
+  If a genuine future need for more than one quick request per candidate ever arises, it must
+  thread that setting through and log distinct `quick_batch_N_of_M` stages (see
+  `analyzeFrames`'s `requestIndex`/`plannedRequestCount` params in `claude.ts`) — never silently
+  fan out again. See README's "A fourth production incident" for the full story, including why
+  detailed analysis's own reservation getting blocked must land a candidate in the terminal
+  `ai_budget_exhausted` status rather than reverting it to `waiting_for_ai` (quick scan's cost is
+  already committed and non-refundable — reverting would re-incur it for zero new information).
 - **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
   never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
   `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.

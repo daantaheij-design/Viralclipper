@@ -78,6 +78,8 @@ export async function runDetailedAnalysis(
       analysisJobId: ctx.analysisJobId,
       maxTokens: 4000,
       frameDimensions: { width: video.width, height: video.height },
+      candidateWindowStart: window.startSeconds,
+      candidateWindowEnd: window.endSeconds,
     });
 
     if (!result.data.interesting_moment) {

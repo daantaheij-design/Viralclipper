@@ -13,11 +13,31 @@ export interface DiscoverySettings {
   // this batch costs bandwidth/ffmpeg time only, never Anthropic $, so it
   // can safely be much larger. See src/jobs/analysis.ts.
   freeLocalFilterBatchSize: number;
-  // How many `waiting_for_ai` candidates may receive an actual PAID
-  // Anthropic quick-scan call per analysis tick. Never governs the free
-  // local stage above.
-  maxQuickScansPerRun: number;
-  maxDetailedAnalysesPerRun: number;
+  // How many `waiting_for_ai` SourceVideos may enter the PAID Anthropic
+  // batch per analysis tick — a candidate-count cap, NOT an Anthropic
+  // API-request-count cap (renamed from `maxQuickScansPerRun`, which a real
+  // production incident showed was misleading: with this at 1, a single
+  // selected candidate still generated 2 completed quick_scan requests plus
+  // a blocked 3rd, because quick scan itself used to batch its frames into
+  // multiple requests per candidate — see maxQuickAnthropicRequestsPerCandidate
+  // below, and README's "A fourth production incident"). Never governs the
+  // free local stage above.
+  maxPaidCandidatesPerRun: number;
+  // How many Anthropic quick_scan requests ONE candidate may generate.
+  // Quick scan (src/analysis/quickScan.ts) is architecturally always
+  // exactly one request regardless of this value — it no longer batches
+  // frames into multiple calls — so this exists as an explicit, documented
+  // safety ceiling rather than something the current implementation reads
+  // and loops against. Keep it at 1 in production; if a genuine future need
+  // for more than one quick request per candidate ever arises, quickScan.ts
+  // must read and enforce this value itself (logging distinct
+  // `quick_batch_N_of_M` stages — see claude.ts), not silently fan out.
+  maxQuickAnthropicRequestsPerCandidate: number;
+  // How many detailed_analysis Anthropic requests ONE candidate may
+  // generate (one per candidate window, bounded by this — renamed from
+  // maxDetailedAnalysesPerRun, which was already per-candidate in practice
+  // but named ambiguously alongside the equally-misnamed maxQuickScansPerRun).
+  maxDetailedAnthropicRequestsPerCandidate: number;
   maxRendersPerRun: number;
 
   // --- Cost control -----------------------------------------------------
@@ -50,8 +70,9 @@ export const DEFAULT_SETTINGS: DiscoverySettings = {
   minViralScore: 70,
   candidatesPerRun: 20,
   freeLocalFilterBatchSize: 25,
-  maxQuickScansPerRun: 1,
-  maxDetailedAnalysesPerRun: 1,
+  maxPaidCandidatesPerRun: 1,
+  maxQuickAnthropicRequestsPerCandidate: 1,
+  maxDetailedAnthropicRequestsPerCandidate: 1,
   maxRendersPerRun: 1,
 
   paidAiAnalysisEnabled: false,

@@ -54,12 +54,25 @@ function estimatedTokensPerImage(dimensions?: FrameDimensions): number {
 }
 
 /**
+ * Pessimistic upper-bound input-token estimate for one `analyzeFrames` call
+ * — exported (not just internal to `estimateMaxCostUsd`) so callers can log
+ * `estimatedInputTokens` alongside the real `actualInputTokens` a response
+ * comes back with, for direct before/after comparison in the `[anthropic]`
+ * logs.
+ */
+export function estimateInputTokens(frameCount: number, frameDimensions?: FrameDimensions): number {
+  return frameCount * estimatedTokensPerImage(frameDimensions) + ESTIMATED_PROMPT_OVERHEAD_TOKENS;
+}
+
+/**
  * Pessimistic upper-bound cost estimate for one `analyzeFrames` call, used
  * to reserve budget before the request is sent (see src/ai/budget.ts). Uses
  * `maxTokens` (the request's own output cap) as the output-token estimate,
- * since actual output can never exceed what was requested. Pass the source
- * video's actual frame dimensions when known (quickScan.ts/detailedAnalysis.ts
- * both have `VideoInfo` already) — falls back to a conservative flat
+ * since actual output can never exceed what was requested. Pass the actual
+ * dimensions of the frames being sent (after any local resize —
+ * quickScan.ts/detailedAnalysis.ts both have `VideoInfo` already, but
+ * quickScan.ts now resizes before sending, so its real payload dimensions
+ * differ from the source's native size) — falls back to a conservative flat
  * per-image estimate otherwise.
  */
 export function estimateMaxCostUsd(
@@ -68,7 +81,5 @@ export function estimateMaxCostUsd(
   maxTokens: number,
   frameDimensions?: FrameDimensions,
 ): number {
-  const perImage = estimatedTokensPerImage(frameDimensions);
-  const estimatedInputTokens = frameCount * perImage + ESTIMATED_PROMPT_OVERHEAD_TOKENS;
-  return estimateCostUsd(model, estimatedInputTokens, maxTokens);
+  return estimateCostUsd(model, estimateInputTokens(frameCount, frameDimensions), maxTokens);
 }

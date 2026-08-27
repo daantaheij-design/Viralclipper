@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import type { z } from "zod";
 import { env, requireAnthropicKey } from "@/lib/env";
-import { estimateCostUsd, estimateMaxCostUsd } from "@/ai/pricing";
+import { estimateCostUsd, estimateInputTokens } from "@/ai/pricing";
 import type { FrameDimensions } from "@/ai/pricing";
 import { recordApiUsage } from "@/ai/costTracking";
 import { AiBudgetBlockedError, commitReservation, releaseReservation, reserveAiBudget } from "@/ai/budget";
@@ -37,8 +37,14 @@ export interface VisionAnalysisInput<T extends z.ZodTypeAny> {
   momentId?: string;
   analysisJobId?: string;
   maxTokens?: number;
-  /** Source video's native frame dimensions (frames are never resized before being sent — see video/ffmpeg.ts) — used to make the pre-call cost estimate realistic instead of a flat guess. See src/ai/pricing.ts. */
+  /** The actual dimensions of the frames being sent (after any local resize — see video/ffmpeg.ts's `maxWidth`/`maxHeight`) — used to make the pre-call cost estimate realistic instead of a flat guess. See src/ai/pricing.ts. */
   frameDimensions?: FrameDimensions;
+  /** 1-based position of this request among `plannedRequestCount` for the same candidate/stage — purely for observability (see the `[anthropic]` logs below). Omit for a stage that's always exactly one request (e.g. quick scan); both default to 1 when omitted. */
+  requestIndex?: number;
+  plannedRequestCount?: number;
+  /** Source-video-absolute seconds this request's frames span — omit for a request (like quick scan) that samples the whole video rather than one candidate window. */
+  candidateWindowStart?: number;
+  candidateWindowEnd?: number;
 }
 
 export interface VisionAnalysisResult<T> {
@@ -74,7 +80,29 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
   input: VisionAnalysisInput<T>,
 ): Promise<VisionAnalysisResult<z.infer<T>>> {
   const maxTokens = input.maxTokens ?? 8000;
-  const estimatedCostUsd = estimateMaxCostUsd(env.claudeModel, input.frames.length, maxTokens, input.frameDimensions);
+  const estimatedInputTokens = estimateInputTokens(input.frames.length, input.frameDimensions);
+  const estimatedCostUsd = estimateCostUsd(env.claudeModel, estimatedInputTokens, maxTokens);
+
+  const requestIndex = input.requestIndex ?? 1;
+  const plannedRequestCount = input.plannedRequestCount ?? 1;
+  // A stage that's genuinely always one request logs as plain "quick_scan"/
+  // "detailed_analysis"; a stage that legitimately needed more than one
+  // request logs as "quick_batch_1_of_2" etc. so two requests for the same
+  // candidate/stage are never indistinguishable in the logs — the exact
+  // production incident this exists to prevent recurring silently.
+  const stageLabel = plannedRequestCount > 1 ? `${input.operation}_batch_${requestIndex}_of_${plannedRequestCount}` : input.operation;
+
+  const logFields = {
+    sourceVideoId: input.sourceVideoId,
+    stage: stageLabel,
+    requestIndex,
+    plannedRequestCount,
+    frameCount: input.frames.length,
+    frameWidth: input.frameDimensions?.width,
+    frameHeight: input.frameDimensions?.height,
+    candidateWindowStart: input.candidateWindowStart,
+    candidateWindowEnd: input.candidateWindowEnd,
+  };
 
   const reservation = await reserveAiBudget({
     kind: input.operation,
@@ -85,8 +113,7 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
   });
   if (!reservation.ok) {
     console.log("[anthropic] request blocked", {
-      sourceVideoId: input.sourceVideoId,
-      stage: input.operation,
+      ...logFields,
       reservationUsd: Number(estimatedCostUsd.toFixed(4)),
       reason: reservation.reason,
     });
@@ -94,9 +121,9 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
   }
 
   console.log("[anthropic] request starting", {
-    sourceVideoId: input.sourceVideoId,
-    stage: input.operation,
+    ...logFields,
     reservationUsd: Number(estimatedCostUsd.toFixed(4)),
+    estimatedInputTokens,
     dailySpentBefore: Number(reservation.before.confirmedTodayUsd.toFixed(4)),
     dailyReservedBefore: Number(reservation.before.reservedInFlightUsd.toFixed(4)),
     runSpentBefore: Number(reservation.before.runConfirmedUsd.toFixed(4)),
@@ -144,10 +171,10 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
 
     if (response.parsed_output === null) {
       console.log("[anthropic] request completed", {
-        sourceVideoId: input.sourceVideoId,
-        stage: input.operation,
-        inputTokens,
-        outputTokens,
+        ...logFields,
+        estimatedInputTokens,
+        actualInputTokens: inputTokens,
+        actualOutputTokens: outputTokens,
         actualCostUsd: Number(costUsd.toFixed(4)),
         result: "schema_mismatch",
       });
@@ -155,10 +182,10 @@ export async function analyzeFrames<T extends z.ZodTypeAny>(
     }
 
     console.log("[anthropic] request completed", {
-      sourceVideoId: input.sourceVideoId,
-      stage: input.operation,
-      inputTokens,
-      outputTokens,
+      ...logFields,
+      estimatedInputTokens,
+      actualInputTokens: inputTokens,
+      actualOutputTokens: outputTokens,
       actualCostUsd: Number(costUsd.toFixed(4)),
       result: "ok",
     });

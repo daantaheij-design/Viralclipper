@@ -26,6 +26,7 @@ interface Stats {
     rejectedByDetailedAi: number;
     rejectedBelowScore: number;
     aiFailures: number;
+    budgetExhausted: number;
     videosSentToAnthropic: number;
     anthropicApiRequests: number;
     detailedAnalyses: number;
@@ -128,6 +129,7 @@ export function StatsPanel() {
           <FunnelRow label="Rejected after detailed AI" value={stats.funnel.rejectedByDetailedAi} dim />
           <FunnelRow label="Rejected — below viral score" value={stats.funnel.rejectedBelowScore} dim />
           <FunnelRow label="AI failures" value={stats.funnel.aiFailures} dim />
+          <FunnelRow label="Budget exhausted (quick done, detailed blocked)" value={stats.funnel.budgetExhausted} dim />
           <FunnelRow label="Good moments" value={stats.funnel.goodMoments} />
           <div className="flex items-center justify-between border-b border-border/50 py-2 text-sm last:border-0">
             <span className="text-foreground">Actual AI cost today</span>
