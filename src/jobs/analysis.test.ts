@@ -5,7 +5,8 @@ import { readFile } from "node:fs/promises";
 import { prisma } from "@/database/client";
 import { updateSettings } from "@/database/settings";
 import { env } from "@/lib/env";
-import { runAnalysis, summarizePersistedUsage } from "./analysis";
+import { acquisitionEligible } from "@/database/acquisitionCooldown";
+import { runAnalysis, summarizePersistedUsage, MAX_PAID_ANALYSIS_ATTEMPTS } from "./analysis";
 import type { VideoProcessingStatus } from "@/generated/prisma";
 
 async function makeCandidate(titleSuffix: string, status: VideoProcessingStatus = "discovered") {
@@ -306,6 +307,182 @@ test("jobs/analysis.ts: the paid batch query excludes candidates at or past MAX_
   assert.ok(batchFnStart > -1 && batchFnEnd > batchFnStart);
   const section = src.slice(batchFnStart, batchFnEnd);
   assert.match(section, /paidAnalysisAttempts:\s*\{\s*lt:\s*MAX_PAID_ANALYSIS_ATTEMPTS\s*\}/);
+});
+
+// --- Paid queue selection fix (production incident: worker selected 0 of 55 waiting_for_ai candidates) ---
+
+/**
+ * All tests below force a deterministic, real (not mocked) media-acquisition
+ * failure by pointing env.ytDlpPath at a nonexistent binary for the test's
+ * duration — this reproduces `binary_missing`/`environmentBroken` exactly
+ * the way the real production incident did, without ever touching network
+ * or Anthropic. Same established pattern as this suite's existing use of
+ * env.anthropicApiKey (see src/ai/budget.test.ts).
+ */
+async function withBrokenYtDlp<T>(fn: () => Promise<T>): Promise<T> {
+  const before = env.ytDlpPath;
+  env.ytDlpPath = "/nonexistent/yt-dlp-binary-for-tests";
+  try {
+    return await fn();
+  } finally {
+    env.ytDlpPath = before;
+  }
+}
+
+test("runAnalysis: a waiting_for_ai candidate IS selected by the paid worker even when the free batch's environment is broken (production regression)", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  const beforeKey = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  // One free-batch candidate (will hit binary_missing and set
+  // local.environmentBroken=true) plus one pre-existing waiting_for_ai
+  // candidate created directly via prisma — exactly like a real production
+  // backlog row that survived a prior deploy, never touching discovery.
+  const freeBatchVictim = await makeCandidate("free-batch-victim");
+  const waitingCandidate = await makeCandidate("preexisting-waiting", "waiting_for_ai");
+  try {
+    const countBefore = await prisma.sourceVideo.count();
+
+    await withBrokenYtDlp(() => runAnalysis());
+
+    const countAfter = await prisma.sourceVideo.count();
+    assert.equal(countAfter, countBefore, "no new SourceVideo rows — the existing candidate must not be rediscovered or duplicated");
+
+    const updated = await prisma.sourceVideo.findUniqueOrThrow({ where: { id: waitingCandidate.id } });
+    assert.ok(
+      updated.paidAnalysisAttempts >= 1,
+      `expected the pre-existing waiting_for_ai candidate to be selected and attempted by the paid batch (paidAnalysisAttempts >= 1), got ${updated.paidAnalysisAttempts} — before the fix, a broken free-batch environment silently skipped the entire paid batch`,
+    );
+    assert.notEqual(updated.status, "waiting_for_ai", "having been selected and attempted, it must leave waiting_for_ai (not sit forever looking untouched)");
+    assert.notEqual(updated.status, "ai_processing", "a failed attempt must not leave the candidate stuck in the transient ai_processing state");
+  } finally {
+    env.anthropicApiKey = beforeKey;
+    await cleanupVideos([freeBatchVictim.id, waitingCandidate.id]);
+  }
+});
+
+test("runAnalysis: Paid AI OFF leaves waiting_for_ai candidates untouched even when the free batch's environment is broken", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  const freeBatchVictim = await makeCandidate("free-batch-victim-off");
+  const waitingCandidate = await makeCandidate("waiting-off", "waiting_for_ai");
+  try {
+    const summary = await withBrokenYtDlp(() => runAnalysis());
+    assert.equal(summary.anthropicRequestsCompleted, 0);
+
+    const updated = await prisma.sourceVideo.findUniqueOrThrow({ where: { id: waitingCandidate.id } });
+    assert.equal(updated.status, "waiting_for_ai");
+    assert.equal(updated.paidAnalysisAttempts, 0, "Paid AI is off — the candidate must not be selected or attempted at all");
+  } finally {
+    await cleanupVideos([freeBatchVictim.id, waitingCandidate.id]);
+  }
+});
+
+test("runAnalysis: with maxQuickScansPerRun=1, exactly 1 of several waiting_for_ai candidates is selected — never 0", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  const videos = await Promise.all(Array.from({ length: 5 }, (_, i) => makeCandidate(`selection-${i}`, "waiting_for_ai")));
+  try {
+    await runAnalysis();
+    const rows = await prisma.sourceVideo.findMany({ where: { id: { in: videos.map((v) => v.id) } }, select: { id: true, paidAnalysisAttempts: true } });
+    const selected = rows.filter((r) => r.paidAnalysisAttempts > 0);
+    assert.equal(selected.length, 1, `expected exactly 1 of 5 waiting_for_ai candidates selected with maxQuickScansPerRun=1, got ${selected.length}`);
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanupVideos(videos.map((v) => v.id));
+  }
+});
+
+test("runAnalysis: two concurrent invocations never select the same waiting_for_ai candidate twice", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  const videos = await Promise.all(Array.from({ length: 2 }, (_, i) => makeCandidate(`concurrent-${i}`, "waiting_for_ai")));
+  try {
+    await Promise.all([runAnalysis(), runAnalysis()]);
+    const rows = await prisma.sourceVideo.findMany({ where: { id: { in: videos.map((v) => v.id) } }, select: { paidAnalysisAttempts: true } });
+    const totalAttempts = rows.reduce((sum, r) => sum + r.paidAnalysisAttempts, 0);
+    assert.ok(
+      totalAttempts <= 1,
+      `two concurrent runAnalysis() calls with maxQuickScansPerRun=1 must select at most 1 candidate total (the DB-backed analysis lock serializes them) — got ${totalAttempts} total attempts across both`,
+    );
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanupVideos(videos.map((v) => v.id));
+  }
+});
+
+test("runAnalysis: a media-acquisition failure before any Anthropic call leaves zero ApiUsage rows and an explicit terminal status, not stuck in ai_processing", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  const before = env.anthropicApiKey;
+  env.anthropicApiKey = "sk-test-fake-key";
+  const video = await makeCandidate("acquisition-fails", "waiting_for_ai");
+  try {
+    await withBrokenYtDlp(() => runAnalysis());
+
+    const usageCount = await prisma.apiUsage.count({ where: { sourceVideoId: video.id } });
+    assert.equal(usageCount, 0, "media acquisition failed before any Anthropic call — zero ApiUsage rows must exist");
+
+    const updated = await prisma.sourceVideo.findUniqueOrThrow({ where: { id: video.id } });
+    assert.notEqual(updated.status, "ai_processing", "must not be left stuck in the transient processing state");
+    assert.notEqual(updated.status, "waiting_for_ai", "a real attempt was made — it must not look untouched");
+    assert.equal(updated.paidAnalysisAttempts, 1, "the attempt must still be counted toward the retry cap");
+  } finally {
+    env.anthropicApiKey = before;
+    await cleanupVideos([video.id]);
+  }
+});
+
+test("waiting_for_ai eligibility: the dashboard's count query and the paid worker's eligible-candidate query agree for a fresh backlog", async () => {
+  const videos = await Promise.all(Array.from({ length: 4 }, (_, i) => makeCandidate(`consistency-${i}`, "waiting_for_ai")));
+  try {
+    const dashboardCount = await prisma.sourceVideo.count({
+      where: { status: "waiting_for_ai", id: { in: videos.map((v) => v.id) } },
+    });
+    const paidEligibleCount = await prisma.sourceVideo.count({
+      where: {
+        AND: [
+          { status: "waiting_for_ai" },
+          { id: { in: videos.map((v) => v.id) } },
+          { paidAnalysisAttempts: { lt: MAX_PAID_ANALYSIS_ATTEMPTS } },
+          acquisitionEligible(new Date()),
+        ],
+      },
+    });
+    assert.equal(dashboardCount, 4);
+    assert.equal(
+      paidEligibleCount,
+      dashboardCount,
+      "a fresh waiting_for_ai backlog (0 paid attempts, never access-blocked) must be exactly as eligible for paid selection as the dashboard's plain status count says it is",
+    );
+  } finally {
+    await cleanupVideos(videos.map((v) => v.id));
+  }
+});
+
+test("jobs/analysis.ts: paid selection is never gated on the free batch's environmentBroken result (source text)", async () => {
+  const src = await readFile(new URL("./analysis.ts", import.meta.url), "utf8");
+  const gateStart = src.indexOf("const aiAvailable = settings.paidAiAnalysisEnabled");
+  assert.ok(gateStart > -1);
+  // The ternary driving `paid` (a few lines below `aiAvailable`) must never
+  // reference local.environmentBroken.
+  const section = src.slice(gateStart, gateStart + 400);
+  assert.doesNotMatch(
+    section,
+    /local\.environmentBroken/,
+    "runPaidAnthropicBatch's invocation must never be conditioned on the free batch's environmentBroken result",
+  );
+});
+
+test("jobs/analysis.ts: a candidate is transitioned to ai_processing before any acquisition/Anthropic call (source text)", async () => {
+  const src = await readFile(new URL("./analysis.ts", import.meta.url), "utf8");
+  const fnStart = src.indexOf("async function runPaidAnalysisOnVideo");
+  const fnEnd = src.indexOf("async function acquireSourceFile");
+  assert.ok(fnStart > -1 && fnEnd > fnStart);
+  const section = src.slice(fnStart, fnEnd);
+  const statusUpdateIndex = section.indexOf('status: "ai_processing"');
+  const acquireCallIndex = section.indexOf("await acquireSourceFile(video, scratchDir)");
+  assert.ok(statusUpdateIndex > -1 && acquireCallIndex > -1);
+  assert.ok(statusUpdateIndex < acquireCallIndex, "the ai_processing transition must happen before acquisition (and therefore before any Anthropic call)");
 });
 
 test("jobs/analysis.ts: the free local batch query is never bounded by maxQuickScansPerRun in the source text", async () => {
