@@ -67,7 +67,7 @@ const ANALYSIS_STALE_AFTER_MS = 30 * 60 * 1000;
 // + Anthropic-attempt cycles for one stubborn candidate (e.g. one that
 // keeps hitting the budget gate, or whose analysis keeps throwing). See
 // `SourceVideo.paidAnalysisAttempts`'s schema comment.
-const MAX_PAID_ANALYSIS_ATTEMPTS = 3;
+export const MAX_PAID_ANALYSIS_ATTEMPTS = 3;
 
 function emptySummary(): AnalysisRunSummary {
   return {
@@ -117,8 +117,24 @@ async function runAnalysisLocked(): Promise<AnalysisRunSummary> {
 
   const local = await runFreeLocalFilteringBatch(settings.freeLocalFilterBatchSize, settings.minSourceCleanlinessScore, now);
 
+  // Deliberately NOT gated on `local.environmentBroken`. The free batch and
+  // the paid batch query, acquire, and process entirely disjoint sets of
+  // candidates (discovered/queued_for_scan/source_access_blocked vs.
+  // waiting_for_ai) — a broken yt-dlp/ffmpeg environment discovered while
+  // processing ONE free-batch candidate says nothing about whether the
+  // *paid* batch's own candidates can be acquired, and the paid batch
+  // already does its own environment-broken detection (via its own
+  // acquireSourceFile call inside runPaidAnalysisOnVideo) and stops itself
+  // early if that also turns out to be broken. Gating the paid batch's
+  // invocation on the free batch's outcome was a real production bug: a
+  // worker tick logged `[worker] paid Anthropic processing done` with every
+  // field at 0 while 55 real waiting_for_ai candidates existed, because
+  // this ternary skipped runPaidAnthropicBatch entirely (its SELECT never
+  // ran) the moment the free batch's single candidate that tick hit
+  // binary_missing/ffmpeg_missing. See README's "A third production
+  // incident" for the full story.
   const aiAvailable = settings.paidAiAnalysisEnabled && Boolean(env.anthropicApiKey);
-  const paid = aiAvailable && !local.environmentBroken
+  const paid = aiAvailable
     ? await runPaidAnthropicBatch(settings.maxQuickScansPerRun, settings.maxDetailedAnalysesPerRun, settings.minViralScore, now)
     : {
         anthropicRequestsAttempted: 0,
@@ -344,13 +360,37 @@ async function runPaidAnthropicBatch(
   minViralScore: number,
   now: Date,
 ): Promise<PaidAnthropicBatchResult> {
+  const eligibleWhere: Prisma.SourceVideoWhereInput = {
+    AND: [{ status: "waiting_for_ai" }, { paidAnalysisAttempts: { lt: MAX_PAID_ANALYSIS_ATTEMPTS } }, acquisitionEligible(now)],
+  };
+
+  // Production-safe queue diagnostics, logged BEFORE selection so a tick
+  // that finds 0 candidates is never silently indistinguishable from one
+  // where the queue was genuinely empty. `waitingForAiTotal` is
+  // deliberately computed the exact same way
+  // (`prisma.sourceVideo.count({ where: { status: "waiting_for_ai" } })`)
+  // as the Settings/stats dashboard's "Clean candidates / waiting for AI"
+  // tile, so the two numbers are directly comparable in the logs — this is
+  // the fix for a real incident where the dashboard showed 55 waiting_for_ai
+  // rows but the worker log showed 0 selected with no way to tell why.
+  const [waitingForAiTotal, blockedByAttemptCap, eligibleForPaidSelection] = await Promise.all([
+    prisma.sourceVideo.count({ where: { status: "waiting_for_ai" } }),
+    prisma.sourceVideo.count({ where: { status: "waiting_for_ai", paidAnalysisAttempts: { gte: MAX_PAID_ANALYSIS_ATTEMPTS } } }),
+    prisma.sourceVideo.count({ where: eligibleWhere }),
+  ]);
+
   const candidates = await prisma.sourceVideo.findMany({
-    where: {
-      AND: [{ status: "waiting_for_ai" }, { paidAnalysisAttempts: { lt: MAX_PAID_ANALYSIS_ATTEMPTS } }, acquisitionEligible(now)],
-    },
+    where: eligibleWhere,
     orderBy: { preliminaryScore: "desc" },
     take: maxQuickScans,
     include: { source: true },
+  });
+
+  console.log("[worker] paid queue status", {
+    waitingForAiTotal,
+    eligibleForPaidSelection,
+    blockedByAttemptCap,
+    selected: candidates.length,
   });
 
   const runToken = generateRunToken();
@@ -359,6 +399,7 @@ async function runPaidAnthropicBatch(
   const circuitBreaker = new AcquisitionCircuitBreaker();
 
   for (const video of candidates) {
+    console.log("[worker] paid candidate selected", { sourceVideoId: video.id, status: video.status });
     const result = await runPaidAnalysisOnVideo(video, maxDetailedAnalyses, minViralScore, runToken);
     momentsFound += result.momentsFound;
     anthropicRequestsAttempted += result.requestsAttempted;

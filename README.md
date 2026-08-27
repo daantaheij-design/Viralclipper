@@ -215,6 +215,45 @@ three further gaps, all fixed here:
   exhausted its attempts — including one repeatedly budget-blocked — is excluded from future paid
   batches and parked as `ai_failed` rather than being retried forever.
 
+#### A third production incident: the paid batch must never depend on the free batch's outcome
+
+After the second incident's fix shipped, a run with Paid AI Analysis temporarily on (real
+`ANTHROPIC_API_KEY` present) logged `[worker] paid Anthropic processing done` with every field at
+0 — `anthropicRequestsCompleted: 0`, `paidCandidatesProcessed: 0`, etc. — while the dashboard
+simultaneously showed 55 real `SourceVideo` rows with `status = "waiting_for_ai"`. The worker had
+genuinely entered the paid-processing branch (the log message itself proves `Paid AI Analysis` was
+on and the API key was present — `aiAvailable` was true) but its own `runPaidAnthropicBatch` query
+never ran at all.
+
+Root cause: `runAnalysisLocked` gated the *entire* invocation of `runPaidAnthropicBatch` on
+`!local.environmentBroken` — a flag set by the unrelated FREE batch (see the bullet above) when
+one of *its own* candidates hit a `binary_missing`/`ffmpeg_missing` acquisition failure (yt-dlp or
+ffmpeg missing from `PATH` on that worker container). The free batch and the paid batch query,
+acquire, and process entirely disjoint candidate sets (`discovered`/`queued_for_scan`/
+`source_access_blocked` vs. `waiting_for_ai`) — a broken environment discovered while processing
+one free-batch candidate says nothing about whether the paid batch's own candidates can be
+acquired, and the paid batch already does its own independent environment-broken detection (a
+fresh `acquireSourceFile` call inside `runPaidAnalysisOnVideo`) and stops itself early if that also
+turns out to be broken. Gating the paid batch's *invocation* on the free batch's *result* meant a
+single bad free-batch candidate could silently zero out paid processing for an entire tick — the
+paid `SELECT` never ran, so all 55 `waiting_for_ai` rows sat completely untouched despite Paid AI
+Analysis being on.
+
+The fix: `runAnalysisLocked` now calls `runPaidAnthropicBatch` whenever `aiAvailable` is true, full
+stop — never conditioned on `local.environmentBroken`. Media reacquisition itself was **not** part
+of this bug: `runPaidAnalysisOnVideo` already calls `acquireSourceFile` fresh (its own scratch dir,
+its own download) rather than depending on any file the free stage's cleanliness scan left behind
+— exactly what's needed since the Railway worker's filesystem is ephemeral and a free-stage scratch
+file is deleted the moment that stage finishes with it.
+
+`runPaidAnthropicBatch` now also logs `[worker] paid queue status { waitingForAiTotal,
+eligibleForPaidSelection, blockedByAttemptCap, selected }` *before* selection — `waitingForAiTotal`
+is computed with the exact same query as the Settings dashboard's "Clean candidates / waiting for
+AI" tile, so the two numbers are always directly comparable — and `[worker] paid candidate
+selected { sourceVideoId, status }` for each one actually picked, so a future "0 selected, N
+waiting" tick is immediately diagnosable from the log alone instead of requiring an investigation
+like this one.
+
 ### Media acquisition: being discovered ≠ being downloadable
 
 Discovery (finding a video via the YouTube Data API or Reddit's API) and media acquisition
