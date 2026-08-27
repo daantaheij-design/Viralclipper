@@ -70,6 +70,19 @@ URL import, if ever added, is explicitly a secondary tool per the product brief.
   (`anthropicRequestsCompleted`/`quickScans`/`detailedAnalyses`/`paidCandidatesProcessed`/
   `actualCostUsd`) are derived from persisted `ApiUsage` rows rather than accumulated in-memory —
   never reintroduce an in-memory counter as the source of truth for those fields.
+- **`runPaidAnthropicBatch`'s invocation must never be conditioned on the FREE batch's result —
+  only on `aiAvailable` (Paid AI Analysis on + a real API key).** A real production bug: gating it
+  on `!local.environmentBroken` meant one bad free-batch candidate (yt-dlp/ffmpeg missing) silently
+  zeroed out paid processing for the whole tick — the paid `SELECT` never ran, so 55 real
+  `waiting_for_ai` rows sat completely untouched while the worker log claimed
+  `anthropicRequestsCompleted: 0` and looked like an empty queue. The two batches query, acquire,
+  and process disjoint candidate sets and each already does its own independent
+  environment-broken detection — there is no correct reason for one's outcome to gate the other's
+  invocation. If you touch `runAnalysisLocked`, keep `paid` conditioned on `aiAvailable` alone.
+  `runPaidAnthropicBatch` logs `[worker] paid queue status { waitingForAiTotal,
+  eligibleForPaidSelection, blockedByAttemptCap, selected }` before every selection — a mismatch
+  between `waitingForAiTotal` here and the dashboard's own count is the first thing to check if
+  this regresses again.
 - **The Claude model is read from `CLAUDE_MODEL`** (`src/lib/env.ts`, default `claude-opus-5`) —
   never hardcode a model string elsewhere. Same for `YOUTUBE_API_KEY`/Reddit credentials via
   `src/lib/env.ts`'s `require*` helpers, which throw a clear error rather than silently no-op.
