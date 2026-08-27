@@ -189,15 +189,21 @@ export function SettingsForm() {
           min={1}
         />
         <NumberField
-          label="Max quick scans per run (paid)"
-          value={settings.maxQuickScansPerRun}
-          onChange={(v) => save({ ...settings, maxQuickScansPerRun: v })}
+          label="Max paid candidates per run"
+          value={settings.maxPaidCandidatesPerRun}
+          onChange={(v) => save({ ...settings, maxPaidCandidatesPerRun: v })}
           min={0}
         />
         <NumberField
-          label="Max detailed analyses per run"
-          value={settings.maxDetailedAnalysesPerRun}
-          onChange={(v) => save({ ...settings, maxDetailedAnalysesPerRun: v })}
+          label="Max quick Anthropic requests per candidate"
+          value={settings.maxQuickAnthropicRequestsPerCandidate}
+          onChange={(v) => save({ ...settings, maxQuickAnthropicRequestsPerCandidate: v })}
+          min={1}
+        />
+        <NumberField
+          label="Max detailed Anthropic requests per candidate"
+          value={settings.maxDetailedAnthropicRequestsPerCandidate}
+          onChange={(v) => save({ ...settings, maxDetailedAnthropicRequestsPerCandidate: v })}
           min={0}
         />
         <NumberField

@@ -21,15 +21,16 @@ type SourceVideoWithSource = Prisma.SourceVideoGetPayload<{ include: { source: t
 
 export interface AnalysisRunSummary {
   // FREE local filtering (acquisition + source-cleanliness scan) — governed
-  // by `freeLocalFilterBatchSize`, NEVER by maxQuickScansPerRun. Zero
+  // by `freeLocalFilterBatchSize`, NEVER by maxPaidCandidatesPerRun. Zero
   // Anthropic cost regardless of how large this batch is.
   videosScanned: number; // candidates that went through the free local stage this tick
   dirtyLeads: number; // newly classified dirty_lead this tick
   waitingForAi: number; // newly became waiting_for_ai (clean, ready, parked) this tick
 
-  // PAID Anthropic processing — governed by maxQuickScansPerRun /
-  // maxDetailedAnalysesPerRun / the AI budget gate. Only runs at all when
-  // Paid AI Analysis is on and a real ANTHROPIC_API_KEY is configured.
+  // PAID Anthropic processing — governed by maxPaidCandidatesPerRun /
+  // maxDetailedAnthropicRequestsPerCandidate / the AI budget gate. Only
+  // runs at all when Paid AI Analysis is on and a real ANTHROPIC_API_KEY is
+  // configured.
   //
   // anthropicRequestsAttempted/Completed/quickScans/detailedAnalyses/
   // actualCostUsd are all derived AFTER the batch by querying the
@@ -87,7 +88,7 @@ function emptySummary(): AnalysisRunSummary {
 /**
  * FREE local filtering (acquisition + src/analysis/sourceCleanliness.ts,
  * batched up to `freeLocalFilterBatchSize`, zero Anthropic cost, always
- * runs) → PAID Anthropic processing (batched up to `maxQuickScansPerRun`,
+ * runs) → PAID Anthropic processing (batched up to `maxPaidCandidatesPerRun`,
  * only when Paid AI Analysis is on). These are two independent batch
  * sizes on purpose — see README's "Cost control" section. Category
  * prefiltering (src/discovery/categoryPrefilter.ts) already ran once at
@@ -135,7 +136,12 @@ async function runAnalysisLocked(): Promise<AnalysisRunSummary> {
   // incident" for the full story.
   const aiAvailable = settings.paidAiAnalysisEnabled && Boolean(env.anthropicApiKey);
   const paid = aiAvailable
-    ? await runPaidAnthropicBatch(settings.maxQuickScansPerRun, settings.maxDetailedAnalysesPerRun, settings.minViralScore, now)
+    ? await runPaidAnthropicBatch(
+        settings.maxPaidCandidatesPerRun,
+        settings.maxDetailedAnthropicRequestsPerCandidate,
+        settings.minViralScore,
+        now,
+      )
     : {
         anthropicRequestsAttempted: 0,
         anthropicRequestsCompleted: 0,
@@ -338,10 +344,13 @@ async function runLocalFilterOnVideo(
 
 // ---------------------------------------------------------------------------
 // PAID Anthropic batch — only ever called when Paid AI Analysis is on and a
-// real ANTHROPIC_API_KEY is configured. Bounded by maxQuickScansPerRun,
-// completely independent of the free batch size above. The hard budget
-// gate (src/ai/budget.ts::reserveAiBudget) is still the true enforcement
-// point — this cap is a courtesy limit on top of it, not a replacement.
+// real ANTHROPIC_API_KEY is configured. Bounded by maxPaidCandidatesPerRun
+// (a candidate-SELECTION cap, not an Anthropic-request cap — see that
+// setting's doc comment in database/settings.ts for the production incident
+// that made this distinction necessary), completely independent of the
+// free batch size above. The hard budget gate
+// (src/ai/budget.ts::reserveAiBudget) is still the true enforcement point —
+// this cap is a courtesy limit on top of it, not a replacement.
 // ---------------------------------------------------------------------------
 
 interface PaidAnthropicBatchResult {
@@ -355,8 +364,8 @@ interface PaidAnthropicBatchResult {
 }
 
 async function runPaidAnthropicBatch(
-  maxQuickScans: number,
-  maxDetailedAnalyses: number,
+  maxPaidCandidates: number,
+  maxDetailedRequestsPerCandidate: number,
   minViralScore: number,
   now: Date,
 ): Promise<PaidAnthropicBatchResult> {
@@ -382,7 +391,7 @@ async function runPaidAnthropicBatch(
   const candidates = await prisma.sourceVideo.findMany({
     where: eligibleWhere,
     orderBy: { preliminaryScore: "desc" },
-    take: maxQuickScans,
+    take: maxPaidCandidates,
     include: { source: true },
   });
 
@@ -400,7 +409,7 @@ async function runPaidAnthropicBatch(
 
   for (const video of candidates) {
     console.log("[worker] paid candidate selected", { sourceVideoId: video.id, status: video.status });
-    const result = await runPaidAnalysisOnVideo(video, maxDetailedAnalyses, minViralScore, runToken);
+    const result = await runPaidAnalysisOnVideo(video, maxDetailedRequestsPerCandidate, minViralScore, runToken);
     momentsFound += result.momentsFound;
     anthropicRequestsAttempted += result.requestsAttempted;
 
@@ -495,7 +504,7 @@ function emptyPaidResult(): PaidAnalysisResult {
 
 async function runPaidAnalysisOnVideo(
   video: SourceVideoWithSource,
-  maxDetailedAnalyses: number,
+  maxDetailedRequestsPerCandidate: number,
   minViralScore: number,
   runToken: string,
 ): Promise<PaidAnalysisResult> {
@@ -599,7 +608,7 @@ async function runPaidAnalysisOnVideo(
     let blockedMidLoop = false;
     let hasQualifyingMoment = false;
     for (const window of windows) {
-      if (detailedAnalysesUsed >= maxDetailedAnalyses) break;
+      if (detailedAnalysesUsed >= maxDetailedRequestsPerCandidate) break;
       detailedAnalysesUsed++;
 
       const candidateWindow = await prisma.candidateWindow.create({
@@ -684,15 +693,27 @@ async function runPaidAnalysisOnVideo(
       }
     }
 
-    // Precisely three distinguishable outcomes once quick scan found at
-    // least one window and detailed analysis ran: a real, qualifying
-    // moment ("scanned" — eligible for render/Top Clips); moments were
+    // Four distinguishable outcomes once quick scan found at least one
+    // window: a real, qualifying moment ("scanned" — eligible for
+    // render/Top Clips, wins even if a later window's detailed reservation
+    // was then blocked — a genuine result was already found); the detailed
+    // budget reservation was blocked before every window could be checked
+    // ("ai_budget_exhausted" — quick scan's real cost is already committed
+    // and must not be re-incurred by reverting to waiting_for_ai; a real
+    // production incident this status exists to prevent); moments were
     // found but none cleared minViralScore ("ai_rejected_below_score" — a
-    // real result, not a failure); or detailed analysis ran but produced
-    // zero DetectedMoment rows at all ("ai_rejected_detailed"). Never
-    // collapse these back into one bucket — that's exactly what made
-    // rejected candidates look like they'd silently vanished.
-    const finalStatus = hasQualifyingMoment ? "scanned" : momentsFound > 0 ? "ai_rejected_below_score" : "ai_rejected_detailed";
+    // real result, not a failure); or detailed analysis ran for every
+    // window and produced zero DetectedMoment rows at all
+    // ("ai_rejected_detailed"). Never collapse these back into one bucket
+    // — that's exactly what made rejected/incomplete candidates look like
+    // they'd silently vanished.
+    const finalStatus = hasQualifyingMoment
+      ? "scanned"
+      : blockedMidLoop
+        ? "ai_budget_exhausted"
+        : momentsFound > 0
+          ? "ai_rejected_below_score"
+          : "ai_rejected_detailed";
     await prisma.sourceVideo.update({
       where: { id: video.id },
       data: {

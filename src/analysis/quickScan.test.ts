@@ -10,7 +10,7 @@ import { probeVideo } from "@/video/ffmpeg";
 import { updateSettings } from "@/database/settings";
 import { prisma } from "@/database/client";
 import { AiBudgetBlockedError } from "@/ai/budget";
-import { runQuickScan } from "./quickScan";
+import { runQuickScan, quickScanFrameCount } from "./quickScan";
 
 /**
  * Proves the hard AI-spend gate (src/ai/budget.ts) is actually reached by
@@ -37,6 +37,15 @@ async function makeTinyVideo(dir: string): Promise<string> {
   ]);
   return videoPath;
 }
+
+test("quickScanFrameCount: always bounded to [6, 12] regardless of source duration — never blindly proportional to length", () => {
+  assert.equal(quickScanFrameCount(0), 6, "degenerate/zero duration still gets the minimum");
+  assert.equal(quickScanFrameCount(30), 6, "a very short source clamps up to the minimum, not down to ~2");
+  assert.equal(quickScanFrameCount(120), 6, "120s / 20s-target = 6, right at the minimum");
+  assert.equal(quickScanFrameCount(180), 9, "180s / 20s-target = 9, within range");
+  assert.equal(quickScanFrameCount(240), 12, "240s / 20s-target = 12, right at the maximum");
+  assert.equal(quickScanFrameCount(3600), 12, "a full hour-long source still clamps down to the maximum, not up to 180");
+});
 
 test("runQuickScan: Paid AI Analysis OFF -> AiBudgetBlockedError, zero ApiUsage rows written", async () => {
   // Deliberately doesn't touch env.anthropicApiKey (unlike src/ai/budget.test.ts)

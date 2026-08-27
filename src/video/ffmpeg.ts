@@ -58,15 +58,28 @@ export interface ExtractedFrame {
  * Timestamps are computed from the requested rate/start rather than read
  * back from ffmpeg — keep this in sync if the sampling filter ever changes
  * to something ffmpeg computes internally (e.g. scene detection).
+ *
+ * `maxWidth`/`maxHeight`, when given, add a `scale=...:force_original_aspect_ratio=decrease`
+ * stage so frames are resized by ffmpeg itself before ever touching disk —
+ * this is what lets quickScan.ts request small, cheap frames instead of
+ * paying to extract (and then have Anthropic tokenize) full native-resolution
+ * frames for a pass that only needs a rough yes/no read on the source. Adding
+ * `scale` doesn't change frame count or spacing, so it doesn't affect the
+ * timestamp computation above.
  */
 export async function extractFrames(
   filePath: string,
   destDir: string,
-  opts: { startSeconds: number; endSeconds: number; framesPerSecond: number },
+  opts: { startSeconds: number; endSeconds: number; framesPerSecond: number; maxWidth?: number; maxHeight?: number },
 ): Promise<ExtractedFrame[]> {
   await mkdir(destDir, { recursive: true });
   const duration = Math.max(opts.endSeconds - opts.startSeconds, 0);
   if (duration <= 0) return [];
+
+  const filters = [`fps=${opts.framesPerSecond}`];
+  if (opts.maxWidth && opts.maxHeight) {
+    filters.push(`scale=${opts.maxWidth}:${opts.maxHeight}:force_original_aspect_ratio=decrease`);
+  }
 
   const pattern = path.join(destDir, "frame_%06d.jpg");
   await run(env.ffmpegPath, [
@@ -77,7 +90,7 @@ export async function extractFrames(
     "-i",
     filePath,
     "-vf",
-    `fps=${opts.framesPerSecond}`,
+    filters.join(","),
     "-q:v",
     "3",
     "-threads",

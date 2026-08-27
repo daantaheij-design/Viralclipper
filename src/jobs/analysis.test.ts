@@ -45,7 +45,7 @@ async function statusesOf(ids: string[]): Promise<VideoProcessingStatus[]> {
 }
 
 test("runAnalysis: two overlapping calls -> only one actually processes candidates (DB-backed analysis lock)", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 5 });
   const videos = await Promise.all([makeCandidate("a"), makeCandidate("b")]);
   try {
     const [first, second] = await Promise.all([runAnalysis(), runAnalysis()]);
@@ -60,13 +60,13 @@ test("runAnalysis: two overlapping calls -> only one actually processes candidat
   }
 });
 
-// --- Requirement A/B: free local filtering is NOT capped by maxQuickScansPerRun ---
+// --- Requirement A/B: free local filtering is NOT capped by maxPaidCandidatesPerRun ---
 
-test("runAnalysis: free local filtering processes up to freeLocalFilterBatchSize candidates, NOT maxQuickScansPerRun (the production bug this PR fixes)", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 5, maxQuickScansPerRun: 1 });
+test("runAnalysis: free local filtering processes up to freeLocalFilterBatchSize candidates, NOT maxPaidCandidatesPerRun (the production bug this PR fixes)", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 5, maxPaidCandidatesPerRun: 1 });
   // 10 pending candidates, a free batch size of 5, and a paid cap of 1 —
   // before this fix, the free stage was wrongly capped at
-  // maxQuickScansPerRun (1 video/tick, matching the exact production log
+  // maxPaidCandidatesPerRun (1 video/tick, matching the exact production log
   // line reported: "videosScanned: 1"). It must now process 5.
   const videos = await Promise.all(Array.from({ length: 10 }, (_, i) => makeCandidate(`backlog-${i}`)));
   try {
@@ -79,13 +79,13 @@ test("runAnalysis: free local filtering processes up to freeLocalFilterBatchSize
   }
 });
 
-test("runAnalysis: the paid Anthropic batch is capped by maxQuickScansPerRun, independent of freeLocalFilterBatchSize", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 2 });
+test("runAnalysis: the paid Anthropic batch is capped by maxPaidCandidatesPerRun, independent of freeLocalFilterBatchSize", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 2 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   // 5 already-clean candidates (as if the free stage already processed
   // them on a prior tick) — none are "discovered", so the free batch has
-  // nothing to do; only the paid batch's own take:maxQuickScansPerRun (2)
+  // nothing to do; only the paid batch's own take:maxPaidCandidatesPerRun (2)
   // should touch any of them this tick. Real acquisition will fail for
   // these fake URLs (no network egress to YouTube in this sandbox) before
   // ever reaching Anthropic — which is fine for this assertion: touching a
@@ -97,7 +97,7 @@ test("runAnalysis: the paid Anthropic batch is capped by maxQuickScansPerRun, in
     const statuses = await statusesOf(videos.map((v) => v.id));
     const stillWaiting = statuses.filter((s) => s === "waiting_for_ai").length;
     const touched = statuses.filter((s) => s !== "waiting_for_ai").length;
-    assert.equal(touched, 2, `expected exactly maxQuickScansPerRun (2) waiting_for_ai candidates touched, got ${touched}`);
+    assert.equal(touched, 2, `expected exactly maxPaidCandidatesPerRun (2) waiting_for_ai candidates touched, got ${touched}`);
     assert.equal(stillWaiting, 3, `expected the other 3 to remain untouched, got ${stillWaiting} still waiting`);
   } finally {
     env.anthropicApiKey = before;
@@ -108,7 +108,7 @@ test("runAnalysis: the paid Anthropic batch is capped by maxQuickScansPerRun, in
 // --- Requirement D: Paid AI OFF -> clean candidates rest at waiting_for_ai, untouched, zero Anthropic calls ---
 
 test("runAnalysis: Paid AI Analysis OFF leaves existing waiting_for_ai candidates parked (never touched), zero Anthropic calls", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 5 });
   const videos = await Promise.all(Array.from({ length: 4 }, (_, i) => makeCandidate(`parked-${i}`, "waiting_for_ai")));
   try {
     const summary = await runAnalysis();
@@ -126,7 +126,7 @@ test("runAnalysis: Paid AI Analysis OFF leaves existing waiting_for_ai candidate
 // --- Requirement C/H: pre-existing backlog is picked up without rediscovery, and a second "restart" tick doesn't duplicate or lose it ---
 
 test("runAnalysis: a pre-existing SourceVideo (created before this code ran, no discovery involved) is picked up by the free batch", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   // Deliberately created directly via prisma, exactly like an old backlog
   // row from before this deploy — never touches runDiscoveryJob/runDiscovery.
   const video = await makeCandidate("legacy-backlog");
@@ -144,7 +144,7 @@ test("runAnalysis: a pre-existing SourceVideo (created before this code ran, no 
 });
 
 test("runAnalysis: a second tick (simulating a worker restart) never reprocesses an already-handled candidate or creates duplicates", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   const video = await makeCandidate("restart-check");
   try {
     await runAnalysis();
@@ -165,7 +165,7 @@ test("runAnalysis: a second tick (simulating a worker restart) never reprocesses
 // --- Requirement I: one bad/inaccessible source never aborts the rest of the free batch ---
 
 test("runAnalysis: an individual candidate's acquisition failure doesn't abort the rest of the free batch", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 4, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 4, maxPaidCandidatesPerRun: 1 });
   // Every candidate here uses a fake, unreachable source URL — every one
   // individually fails acquisition (this sandbox has no real network path
   // to YouTube), which is exactly "one bad/inaccessible source" repeated
@@ -232,7 +232,7 @@ test("summarizePersistedUsage: zero persisted rows -> zero everywhere (nothing t
 });
 
 test("runAnalysis: a candidate that already reached MAX_PAID_ANALYSIS_ATTEMPTS is excluded from the paid batch (never silently retried forever)", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 5 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   const exhausted = await makeCandidate("exhausted", "waiting_for_ai");
@@ -259,7 +259,7 @@ test("runAnalysis: a candidate that already reached MAX_PAID_ANALYSIS_ATTEMPTS i
 });
 
 test("runAnalysis: a candidate already in a terminal AI outcome state is never re-selected by a later tick", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 5 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   const terminalStatuses: VideoProcessingStatus[] = [
@@ -330,7 +330,7 @@ async function withBrokenYtDlp<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 test("runAnalysis: a waiting_for_ai candidate IS selected by the paid worker even when the free batch's environment is broken (production regression)", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   const beforeKey = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   // One free-batch candidate (will hit binary_missing and set
@@ -361,7 +361,7 @@ test("runAnalysis: a waiting_for_ai candidate IS selected by the paid worker eve
 });
 
 test("runAnalysis: Paid AI OFF leaves waiting_for_ai candidates untouched even when the free batch's environment is broken", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 5 });
+  await updateSettings({ paidAiAnalysisEnabled: false, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 5 });
   const freeBatchVictim = await makeCandidate("free-batch-victim-off");
   const waitingCandidate = await makeCandidate("waiting-off", "waiting_for_ai");
   try {
@@ -376,8 +376,8 @@ test("runAnalysis: Paid AI OFF leaves waiting_for_ai candidates untouched even w
   }
 });
 
-test("runAnalysis: with maxQuickScansPerRun=1, exactly 1 of several waiting_for_ai candidates is selected — never 0", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+test("runAnalysis: with maxPaidCandidatesPerRun=1, exactly 1 of several waiting_for_ai candidates is selected — never 0", async () => {
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   const videos = await Promise.all(Array.from({ length: 5 }, (_, i) => makeCandidate(`selection-${i}`, "waiting_for_ai")));
@@ -385,7 +385,7 @@ test("runAnalysis: with maxQuickScansPerRun=1, exactly 1 of several waiting_for_
     await runAnalysis();
     const rows = await prisma.sourceVideo.findMany({ where: { id: { in: videos.map((v) => v.id) } }, select: { id: true, paidAnalysisAttempts: true } });
     const selected = rows.filter((r) => r.paidAnalysisAttempts > 0);
-    assert.equal(selected.length, 1, `expected exactly 1 of 5 waiting_for_ai candidates selected with maxQuickScansPerRun=1, got ${selected.length}`);
+    assert.equal(selected.length, 1, `expected exactly 1 of 5 waiting_for_ai candidates selected with maxPaidCandidatesPerRun=1, got ${selected.length}`);
   } finally {
     env.anthropicApiKey = before;
     await cleanupVideos(videos.map((v) => v.id));
@@ -393,7 +393,7 @@ test("runAnalysis: with maxQuickScansPerRun=1, exactly 1 of several waiting_for_
 });
 
 test("runAnalysis: two concurrent invocations never select the same waiting_for_ai candidate twice", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   const videos = await Promise.all(Array.from({ length: 2 }, (_, i) => makeCandidate(`concurrent-${i}`, "waiting_for_ai")));
@@ -403,7 +403,7 @@ test("runAnalysis: two concurrent invocations never select the same waiting_for_
     const totalAttempts = rows.reduce((sum, r) => sum + r.paidAnalysisAttempts, 0);
     assert.ok(
       totalAttempts <= 1,
-      `two concurrent runAnalysis() calls with maxQuickScansPerRun=1 must select at most 1 candidate total (the DB-backed analysis lock serializes them) — got ${totalAttempts} total attempts across both`,
+      `two concurrent runAnalysis() calls with maxPaidCandidatesPerRun=1 must select at most 1 candidate total (the DB-backed analysis lock serializes them) — got ${totalAttempts} total attempts across both`,
     );
   } finally {
     env.anthropicApiKey = before;
@@ -412,7 +412,7 @@ test("runAnalysis: two concurrent invocations never select the same waiting_for_
 });
 
 test("runAnalysis: a media-acquisition failure before any Anthropic call leaves zero ApiUsage rows and an explicit terminal status, not stuck in ai_processing", async () => {
-  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxQuickScansPerRun: 1 });
+  await updateSettings({ paidAiAnalysisEnabled: true, dailyAiBudgetUsd: 100, freeLocalFilterBatchSize: 25, maxPaidCandidatesPerRun: 1 });
   const before = env.anthropicApiKey;
   env.anthropicApiKey = "sk-test-fake-key";
   const video = await makeCandidate("acquisition-fails", "waiting_for_ai");
@@ -485,7 +485,7 @@ test("jobs/analysis.ts: a candidate is transitioned to ai_processing before any 
   assert.ok(statusUpdateIndex < acquireCallIndex, "the ai_processing transition must happen before acquisition (and therefore before any Anthropic call)");
 });
 
-test("jobs/analysis.ts: the free local batch query is never bounded by maxQuickScansPerRun in the source text", async () => {
+test("jobs/analysis.ts: the free local batch query is never bounded by maxPaidCandidatesPerRun in the source text", async () => {
   const src = await readFile(new URL("./analysis.ts", import.meta.url), "utf8");
   const freeQueryStart = src.indexOf("async function runFreeLocalFilteringBatch");
   const freeQueryEnd = src.indexOf("async function runLocalFilterOnVideo");
@@ -493,8 +493,8 @@ test("jobs/analysis.ts: the free local batch query is never bounded by maxQuickS
   const freeQuerySection = src.slice(freeQueryStart, freeQueryEnd);
   assert.doesNotMatch(
     freeQuerySection,
-    /maxQuickScansPerRun/,
-    "the free local filtering batch must be governed by freeLocalFilterBatchSize only, never maxQuickScansPerRun",
+    /maxPaidCandidatesPerRun/,
+    "the free local filtering batch must be governed by freeLocalFilterBatchSize only, never maxPaidCandidatesPerRun",
   );
   assert.match(freeQuerySection, /batchSize/);
 });

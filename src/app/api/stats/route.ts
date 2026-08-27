@@ -32,6 +32,7 @@ export async function GET() {
     rejectedByDetailedAiCount,
     rejectedBelowScoreCount,
     aiFailedCount,
+    budgetExhaustedCount,
     quickScanUsage,
     detailedAnalysisUsage,
     quickScanCostAgg,
@@ -44,7 +45,16 @@ export async function GET() {
     prisma.sourceVideo.count({
       where: {
         status: {
-          in: ["scanned", "no_candidates", "ai_rejected_quick", "ai_rejected_detailed", "ai_rejected_below_score", "ai_failed", "error"],
+          in: [
+            "scanned",
+            "no_candidates",
+            "ai_rejected_quick",
+            "ai_rejected_detailed",
+            "ai_rejected_below_score",
+            "ai_budget_exhausted",
+            "ai_failed",
+            "error",
+          ],
         },
       },
     }),
@@ -54,7 +64,7 @@ export async function GET() {
     prisma.discoveryRun.findFirst({ orderBy: { startedAt: "desc" } }),
     // Not yet through the free local stage (acquisition + cleanliness scan)
     // — this is what src/jobs/analysis.ts's free batch drains, independent
-    // of maxQuickScansPerRun. See "Pending local filtering" on the funnel.
+    // of maxPaidCandidatesPerRun. See "Pending local filtering" on the funnel.
     prisma.sourceVideo.count({ where: { status: { in: ["discovered", "queued_for_scan", "source_access_blocked"] } } }),
     prisma.sourceVideo.count({ where: { status: "filtered_out" } }),
     prisma.sourceVideo.count({ where: { status: "dirty_lead" } }),
@@ -65,7 +75,7 @@ export async function GET() {
     // production incident where this looked "stuck" at ~56 (it wasn't a
     // counting bug: the free batch can add up to freeLocalFilterBatchSize
     // new candidates per tick while the paid batch removes at most
-    // maxQuickScansPerRun, so net movement can look flat even while paid
+    // maxPaidCandidatesPerRun, so net movement can look flat even while paid
     // processing is really happening — see aiProcessing/rejectedBy*/
     // aiFailures below for that visibility instead).
     prisma.sourceVideo.count({ where: { status: "waiting_for_ai" } }),
@@ -74,6 +84,11 @@ export async function GET() {
     prisma.sourceVideo.count({ where: { status: "ai_rejected_detailed" } }),
     prisma.sourceVideo.count({ where: { status: "ai_rejected_below_score" } }),
     prisma.sourceVideo.count({ where: { status: "ai_failed" } }),
+    // Quick scan succeeded (paid, real cost committed) but the detailed
+    // reservation was blocked before every window could be checked —
+    // terminal, recoverable-manually-only, never auto-retried. See
+    // ai_budget_exhausted's schema comment.
+    prisma.sourceVideo.count({ where: { status: "ai_budget_exhausted" } }),
     prisma.apiUsage.count({ where: { provider: "anthropic", operation: "quick_scan" } }),
     prisma.apiUsage.count({ where: { provider: "anthropic", operation: "detailed_analysis" } }),
     prisma.apiUsage.aggregate({
@@ -87,12 +102,14 @@ export async function GET() {
     prisma.apiUsage.count({ where: { provider: "anthropic", createdAt: { gte: since } } }),
     // Distinct source videos that have ever had at least one real Anthropic
     // request — deliberately different from "Anthropic API requests"
-    // (quickScanUsage + detailedAnalysisUsage) below: one video's quick
-    // scan alone can span multiple 40-frame batches (multiple requests),
-    // and a video that gets both a quick scan and a detailed analysis
-    // contributes 2+ requests but is still exactly 1 video. Conflating
-    // these two numbers is part of what made the production dashboard's
-    // "Sent to Anthropic: 12 -> 14" reading ambiguous.
+    // (quickScanUsage + detailedAnalysisUsage) below: a video that gets
+    // both a quick scan and a detailed analysis contributes 2 requests but
+    // is still exactly 1 video (quick scan is architecturally always
+    // exactly one request per candidate — see quickScan.ts — so the only
+    // way one video contributes more than 2 total requests today is more
+    // than one detailed-analysis window). Conflating these two numbers is
+    // part of what made an earlier production dashboard's "Sent to
+    // Anthropic: 12 -> 14" reading ambiguous.
     prisma.apiUsage.groupBy({ by: ["sourceVideoId"], where: { provider: "anthropic", sourceVideoId: { not: null } } }),
   ]);
 
@@ -134,6 +151,7 @@ export async function GET() {
       rejectedByDetailedAi: rejectedByDetailedAiCount,
       rejectedBelowScore: rejectedBelowScoreCount,
       aiFailures: aiFailedCount,
+      budgetExhausted: budgetExhaustedCount,
       // Two deliberately distinct numbers — see the groupBy query above's
       // comment for why they can differ (one video, multiple requests).
       videosSentToAnthropic,

@@ -90,6 +90,24 @@ enum VideoProcessingStatus {
   // one qualifying moment exists") so the dashboard/logs can show this
   // explicitly instead of it looking like the candidate just vanished.
   ai_rejected_below_score
+  // Quick scan succeeded (its real, non-refundable cost was already
+  // committed) and found at least one candidate window, but the budget
+  // reservation for detailed analysis on that window could not be granted
+  // (daily/per-run budget exhausted, or the kill switch flipped off
+  // mid-run) — so detailed analysis never ran for this candidate at all.
+  // Deliberately distinct from `waiting_for_ai`: reverting to
+  // waiting_for_ai here would make this candidate eligible for paid
+  // selection again, and re-running it from scratch would re-incur the
+  // SAME quick-scan cost a second time for zero new information — a real
+  // production incident (~$1.10 spent, zero moments, zero clips, and the
+  // candidate would have been silently re-charged the same amount again
+  // on the next Paid AI run had it reverted to waiting_for_ai). Terminal
+  // like the other ai_* outcomes: not auto-retried, but intentionally
+  // recoverable by a manual, deliberate action later (e.g. resetting it
+  // back to waiting_for_ai once more budget is available) — never
+  // silently reprocessed by the worker itself. See README's "A fourth
+  // production incident".
+  ai_budget_exhausted
   // An unexpected exception during the PAID stage specifically (acquisition
   // failures during re-acquisition use their own existing statuses —
   // `error`/`source_access_blocked` — via the shared acquireSourceFile

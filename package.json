@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "postinstall": "prisma generate",
@@ -12,7 +12,7 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
-    "test": "tsx --test --test-concurrency=1 src/**/*.test.ts",
+    "test": "tsx --test --experimental-test-module-mocks --test-concurrency=1 src/**/*.test.ts",
     "worker": "tsx watch src/worker/index.ts",
     "worker:once": "tsx src/worker/runOnce.ts",
     "start:worker": "tsx src/worker/index.ts",

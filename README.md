@@ -254,6 +254,86 @@ selected { sourceVideoId, status }` for each one actually picked, so a future "0
 waiting" tick is immediately diagnosable from the log alone instead of requiring an investigation
 like this one.
 
+#### A fourth production incident: "quick scan" wasn't actually quick
+
+With paid-queue selection fixed, a controlled test on exactly one selected candidate still spent
+**$1.10** and produced zero moments and zero clips. The worker log showed two *completed*
+`quick_scan` requests (~109,000 input tokens, ~$0.55 each) followed by a third `quick_scan`
+reservation correctly blocked by the daily budget — detailed analysis never ran at all. All three
+were genuinely quick_scan, not accidental duplicates or retries: `quickScan.ts` used to sparsely
+sample the **entire** source video every 1.5s, then batch every 40 of those frames into its own
+full Anthropic request (`for (i = 0; i < frames.length; i += 40) analyzeFrames(...)`) — for
+anything longer than ~60s of source footage, that's two or more full-priced requests per
+candidate, all labeled identically `quick_scan` with no way to tell from the label alone how many
+were coming. Frames were also sent completely unresized: `video/ffmpeg.ts::extractFrames` had no
+resize option, so each frame really was native resolution (matching the incident's ~109k tokens:
+`(1920*1080/750)*1.25 ≈ 3458 tokens/frame * ~31 frames + overhead`) — as expensive per-frame as
+detailed analysis, just applied to the whole video instead of one focused window. Two consequences,
+both real: quick scan (meant to be a cheap yes/no pre-screen) could alone burn an entire run's
+budget before detailed analysis — the stage that actually finds and scores moments — ever got a
+turn; and `maxQuickScansPerRun` (see above — since renamed `maxPaidCandidatesPerRun`) only ever
+bounded how many *candidates* entered the paid batch, never how many *Anthropic requests* one
+candidate could generate, so "1" in that setting was compatible with an unbounded number of real
+API calls.
+
+The fix, entirely in `src/analysis/quickScan.ts` / `src/video/ffmpeg.ts` / `src/ai/pricing.ts`:
+
+- **Exactly one Anthropic request per candidate, structurally** — the batching loop is gone, not
+  just defaulted to a cap. `runQuickScan` extracts a small, duration-bounded frame set
+  (`quickScanFrameCount`: `ceil(duration / 20s)`, clamped to **6–12 frames** regardless of source
+  length — a hurricane-length source still gets only 12, sparser rather than more requests) and
+  makes one call.
+- **Frames are resized before they're ever sent.** `extractFrames` gained optional
+  `maxWidth`/`maxHeight` params that add an ffmpeg `scale=...:force_original_aspect_ratio=decrease`
+  stage — quick scan requests **512×288** (16:9). Chosen over an even smaller box like 384×216
+  because the marginal savings between them is a fraction of a cent at these frame counts, while
+  materially lower resolution risks missing exactly the kind of thing quick scan exists to catch; a
+  384×216 alternative was considered and rejected on that basis, not because 512×288 was assumed
+  correct without comparison.
+- **The pre-call cost estimate uses the frame's real (resized) dimensions**, not the source's
+  native resolution — `analyzeFrames`'s `frameDimensions` param is documented as "the actual
+  dimensions of the frames being sent," and quick scan passes `{512, 288}`, not `video.width` /
+  `video.height`.
+- **A much smaller output-token cap** (`maxTokens: 1500`, down from 4000) — quick scan's output is
+  a short list of candidate windows, and the pre-call reservation treats `maxTokens` as the
+  worst-case output cost, so an oversized cap was inflating every reservation regardless of how
+  small the real output (~200–250 tokens, per the incident's own logs) turned out to be.
+- **Result:** the conservative max-cost estimate for one quick scan is now **≤ $0.056** (12 frames
+  at 512×288, 1500 output tokens, via the exact `estimateMaxCostUsd` the budget gate itself uses) —
+  more than 14x cheaper than the incident's ~$0.7952 reservation for the old 40-native-1080p-frame
+  batch, comfortably under the ≤ $0.10/candidate target.
+- **Explicit, renamed limits** (`src/database/settings.ts`) replace the misleading
+  `maxQuickScansPerRun`: `maxPaidCandidatesPerRun` (how many *SourceVideos* enter the paid batch —
+  what the old name actually did), `maxQuickAnthropicRequestsPerCandidate` (documented safety
+  ceiling — quick scan is architecturally always exactly 1 request regardless of its value, which
+  is a *stronger* guarantee than a runtime-configurable loop bound would be), and
+  `maxDetailedAnthropicRequestsPerCandidate` (renamed from `maxDetailedAnalysesPerRun`, unchanged
+  in meaning — it was already per-candidate). All three default to **1** in production.
+- **Detailed analysis is protected from quick scan's own committed cost.** Quick scan's real cost
+  is committed to `ApiUsage` the moment it succeeds — non-refundable. If the *subsequent* detailed
+  reservation then can't fit the remaining budget, the candidate must never revert to
+  `waiting_for_ai` (that would make it eligible for paid selection again and re-incur the exact
+  same quick-scan cost for zero new information — precisely what happened to the incident's own
+  candidate under the old code). It now lands in a new terminal `ai_budget_exhausted`
+  `SourceVideo` status instead: not auto-retried, but intentionally recoverable by a deliberate
+  manual action later. A one-time, conditional migration
+  (`20260827074100_protect_partially_processed_candidate`) moved the incident's own candidate
+  (`cmt8f9zz4006tla0e826t78b4`) out of `waiting_for_ai` into this state, guarded on it still being
+  `waiting_for_ai` at deploy time — it touches no other row and doesn't alter the ~$1.10 of
+  historical `ApiUsage` already recorded for it.
+- **Observability**: every `[anthropic]` log line now also carries `requestIndex`/
+  `plannedRequestCount` (a stage that's always exactly one request logs plain `quick_scan`; a stage
+  that legitimately needed more than one would log `quick_batch_1_of_2` etc. — two requests for the
+  same candidate/stage can never again be indistinguishable in the logs), `frameCount`/
+  `frameWidth`/`frameHeight`, `candidateWindowStart`/`candidateWindowEnd` (detailed analysis only),
+  and both `estimatedInputTokens` and `actualInputTokens`/`actualOutputTokens` side by side.
+
+Tests for this fix (`src/jobs/analysis.mockedPaidFlow.test.ts`) are the one place in this suite
+that mocks Anthropic — see that file's own doc comment for exactly what's mocked (only
+`analyzeFrames`'s literal network call; the real budget gate, real `ApiUsage` persistence, and real
+cost math all still run) and why (`node --experimental-test-module-mocks`, now in `npm test` —
+see "Testing" below).
+
 ### Media acquisition: being discovered ≠ being downloadable
 
 Discovery (finding a video via the YouTube Data API or Reddit's API) and media acquisition
@@ -577,6 +657,21 @@ without re-verifying determinism first. `src/ai/budget.test.ts` and `src/databas
 exercise real concurrent Postgres transactions (`Promise.all` racing several reservation/lock
 attempts) — per the cost-control PR's explicit requirement, the budget transaction logic is never
 mocked in these tests.
+
+`npm test` also passes `--experimental-test-module-mocks` — needed by exactly one file,
+`src/jobs/analysis.mockedPaidFlow.test.ts`, which is the one deliberate exception to "never mock
+Anthropic/the budget transaction": it mocks only `analyzeFrames`'s literal network call (via
+`node:test`'s `mock.module`, applied to the local `@/ai/providers/claude` module — mocking the
+third-party `@anthropic-ai/sdk` package directly was tried first and does **not** reliably work
+with tsx's loader, confirmed empirically by a real, if harmless, 401 request still reaching
+api.anthropic.com in that attempt) while reimplementing everything else in that function by calling
+the real `reserveAiBudget`/`commitReservation`/`releaseReservation`/`recordApiUsage` — so the real
+budget gate and real `ApiUsage` persistence are still exercised for real, only the HTTP round-trip
+is faked. This exists because proving the quick-scan-cost-blowup fix (exact request counts,
+budget-exhaustion handling) needs a completed quick-scan/detailed-analysis *result*, which no
+amount of testing only the "blocked before any call" paths (the rest of this suite's approach) can
+reach. Never add a real `ANTHROPIC_API_KEY` to make a test "more real" instead of extending this
+mock — that defeats the entire point.
 
 `video/renderVertical.ts`'s actual ffmpeg filter-graph output should be spot-checked against a
 real clip before relying on it, the same way `smartCrop.ts`'s pan math should be sanity-checked
